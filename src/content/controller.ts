@@ -68,6 +68,7 @@ const ATTRIBUTE_FILTER = [
   "hidden",
   "open",
   "aria-hidden",
+  "role",
   "aria-expanded",
   "contenteditable",
   "lang",

@@ -113,7 +113,20 @@ export function createTranslationView(
   }
   // Controls replace their label in its original layout slot, including bilingual mode.
   // Paragraphs keep the independent translation row below their source.
-  (inlineControl ? controlLabel(element, readSourceNodes()) : element).append(host);
+  if (inlineControl) {
+    const nodes = readSourceNodes();
+    const label = controlLabel(element, nodes);
+    let lastSource: Node | undefined;
+    for (const node of nodes) {
+      if (!readSourceText(node).trim()) continue;
+      let child = node;
+      while (child.parentNode && child.parentNode !== label) child = child.parentNode;
+      if (child.parentNode === label) lastSource = child;
+    }
+    // A direct flex text label may precede a trailing icon. Keep its translated
+    // replacement in that slot instead of appending it after the icon.
+    label.insertBefore(host, lastSource?.nextSibling ?? null);
+  } else element.append(host);
   return {
     host,
     update(parts, retry) {

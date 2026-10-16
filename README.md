@@ -58,6 +58,14 @@ Just Translate 是一个开源 Chrome 翻译插件。接入 DeepSeek 或 OpenAI 
 
 快捷键未生效？打开 `chrome://extensions/shortcuts`，找到 Just Translate 的 **「切换原文 / 译文」**，设置 `Option + Q` / `Alt + Q`。Chrome 必须处于当前活动窗口。
 
+### 安静的设置页
+
+设置页和图标参考 [Kami](https://kami.tw93.fun/index-zh.html) 的暖纸色与墨蓝风格，支持深色外观和窄窗口。图标为原创绘制，字体使用系统字体，不加载远程资源。
+
+![Just Translate 设置页：模型连接、阅读偏好和用量](docs/images/settings.png)
+
+配置保存失败时，保留原连接和正在阅读的译文。配置已保存但清理失败时，会明确提示「已保存，需重载」，不会让你误以为修改没有生效。
+
 ## 关于上下文
 
 不是一句话发一次请求。插件以段落为单位提取文字，把同一内容区域中的连续正文按阅读顺序交给模型；特别长的段落才会拆分。
@@ -77,7 +85,7 @@ Just Translate 是一个开源 Chrome 翻译插件。接入 DeepSeek 或 OpenAI 
 
 ## 适用范围
 
-适合普通网页中的文章和可读文本。暂不支持 PDF、图片文字识别、Canvas、iframe 内文、封闭 Shadow DOM 和 Chrome 内部页面，也不承诺翻译网站上的每一个菜单或控件。
+适合普通网页中的文章和可读文本。暂不支持 PDF、图片文字识别、Canvas、iframe 内文、Shadow DOM 和 Chrome 内部页面，也不承诺翻译网站上的每一个菜单或控件。
 
 译文按纯文本显示，段内链接和强调格式不会映射到译文；需要访问段内链接时，可先切回原文。整张卡片或按钮本身的点击行为会保留。
 
@@ -105,7 +113,7 @@ npm test
 
 构建后，在 Chrome 扩展管理页加载 **`.output/chrome-mv3`**；`npm run dev` 用于本地开发。
 
-浏览器回归使用独立的临时配置和本机测试 API，不读取个人 Chrome 数据：
+浏览器回归使用独立的临时配置和本机测试 API，不读取个人 Chrome 数据。各测试文件串行运行，避免多个 Chromium 实例争抢资源；多标签页场景在同一浏览器内验证。
 
 ```sh
 npx playwright install chromium

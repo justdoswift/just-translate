@@ -10,7 +10,7 @@ function pageFixture() {
   let root = { getAttribute: (name: string) => attributes[name] ?? null };
   const document = {
     querySelector: () => null,
-    querySelectorAll: () => ({ length: 1, item: () => root }),
+    querySelectorAll: () => [root],
     getElementById: () => null,
     getElementsByName: () => [],
   };

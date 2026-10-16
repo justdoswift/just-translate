@@ -228,24 +228,30 @@ export default defineBackground(() => {
     if (session) configurationIds.delete(session.id);
     session?.controller.abort();
     if (session) state.releasePage(session.id);
-    const persisted = persistSessions();
-    await badge(tabId, "off");
-    if (notify && session) {
-      try {
-        await chrome.tabs.sendMessage(
-          tabId,
-          {
-            type: "page:stop",
-            sessionId: session.id,
-            reason,
-          } satisfies PageMessage,
-          { documentId: session.documentId },
-        );
-      } catch {
-        /* Navigation can destroy the former document before restoration. */
-      }
-    }
-    await persisted;
+    // A failed metadata write must not release the next toggle before page:stop.
+    const cleanup = await Promise.allSettled([
+      persistSessions(),
+      (async () => {
+        await badge(tabId, "off");
+        if (notify && session) {
+          try {
+            await chrome.tabs.sendMessage(
+              tabId,
+              {
+                type: "page:stop",
+                sessionId: session.id,
+                reason,
+              } satisfies PageMessage,
+              { documentId: session.documentId },
+            );
+          } catch {
+            /* Navigation can destroy the former document before restoration. */
+          }
+        }
+      })(),
+    ]);
+    for (const outcome of cleanup)
+      if (outcome.status === "rejected") throw outcome.reason;
   }
 
   function liveSession(
@@ -464,21 +470,35 @@ export default defineBackground(() => {
     }
     if (message.type === "settings:save") {
       const next = validateSettings(message.settings);
-      const key = validateKey(message.apiKey, false);
+      const key = validateKey(message.apiKey);
       const operation = configuration.then(async () => {
         await requireApiPermission(next);
+        const result = await settings.save(next, key);
         configurationEpoch++;
         intents.clear();
         engine.cancelTests();
-        await Promise.all(
-          [...sessions.keys()].map((tabId) =>
-            stop(tabId, "设置已更改，请重新开始翻译。"),
-          ),
+        // Persistence above is the commit. Cleanup failures must remain visible
+        // without claiming that the now-active configuration was rolled back.
+        const cleanup = await Promise.allSettled([
+          Promise.allSettled(
+            [...sessions.keys()].map((tabId) =>
+              stop(tabId, "设置已更改，请重新开始翻译。"),
+            ),
+          ).then((outcomes) => {
+            for (const outcome of outcomes)
+              if (outcome.status === "rejected") throw outcome.reason;
+          }),
+          state.configure(next),
+          chrome.storage.session.remove(STARTUP_ERROR_KEY),
+        ]);
+        const failed = cleanup.flatMap((outcome, index) =>
+          outcome.status === "rejected"
+            ? [["会话清理", "缓存设置", "启动提示清理"][index]]
+            : [],
         );
-        const result = await settings.save(next, key);
-        await state.configure(next);
-        await chrome.storage.session.remove(STARTUP_ERROR_KEY);
-        return result;
+        return failed.length
+          ? { ...result, warning: `配置已保存，但${failed.join("、")}未完成。请重新加载扩展。` }
+          : result;
       });
       configuration = operation.catch(() => undefined);
       return operation;
