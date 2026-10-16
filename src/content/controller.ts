@@ -21,12 +21,7 @@ import {
   type ExtractedSource,
 } from "./extraction";
 import { observeNavigation, type NavigationWatch } from "./navigation";
-import {
-  createProgressView,
-  createTranslationView,
-  type ProgressView,
-  type TranslationView,
-} from "./renderer";
+import { createTranslationView, type TranslationView } from "./renderer";
 
 interface Task {
   segment: Segment;
@@ -96,7 +91,6 @@ class PageSession {
   private readonly observer: MutationObserver;
   private readonly intersection: IntersectionObserver;
   private readonly navigation: NavigationWatch;
-  private readonly progressView: ProgressView;
   private scanTimer?: number;
   private progressTimer?: number;
   private pumpTimer?: number;
@@ -123,10 +117,6 @@ class PageSession {
       { rootMargin: "250px" },
     );
     this.navigation = observeNavigation((reason) => this.stop(reason));
-    this.progressView = createProgressView(
-      () => this.stop("用户恢复原文。"),
-      (node) => this.owned.add(node),
-    );
     // Observe before the initial scan so hydration and lazy insertion cannot fall through a gap.
     this.observer.observe(document.documentElement, {
       subtree: true,
@@ -154,7 +144,6 @@ class PageSession {
     this.observer.disconnect();
     this.intersection.disconnect();
     this.navigation.disconnect();
-    this.progressView.remove();
     document.removeEventListener("toggle", this.toggle, true);
     window.clearTimeout(this.scanTimer);
     window.clearTimeout(this.progressTimer);
@@ -579,8 +568,7 @@ class PageSession {
           ? undefined
           : task.text,
       error: task.error,
-      pending:
-        task.manual && (task.state === "queued" || task.state === "pending"),
+      pending: task.state === "queued" || task.state === "pending",
     }));
     if (
       !parts.some(
@@ -675,7 +663,6 @@ class PageSession {
       const fingerprint = JSON.stringify(progress);
       if (fingerprint === this.lastProgress) return;
       this.lastProgress = fingerprint;
-      this.progressView.update(progress);
       void sendMessage<void>({ type: "page:progress", progress });
     };
     if (immediate) publish();

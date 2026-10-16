@@ -37,7 +37,7 @@ test(
     const requested: string[] = [];
     const connectionText = "Hello! This is a connection test.";
     const modelGate = new EventEmitter();
-    let holdFirstPageRequest = true;
+    let holdPageRequest = true;
     const translations = new Map([
       ["Read this page in your own language.", "用你自己的语言阅读此页面。"],
       [
@@ -74,8 +74,8 @@ test(
                 : translations.get(item.text),
           };
         });
-        if (holdFirstPageRequest && input.items[0]?.text !== connectionText) {
-          holdFirstPageRequest = false;
+        if (holdPageRequest && input.items[0]?.text !== connectionText) {
+          holdPageRequest = false;
           const released = once(modelGate, "release");
           modelGate.emit("requested");
           await released;
@@ -195,6 +195,9 @@ test(
     const waitForTranslations = async (expected: string[]) => {
       await page.waitForFunction(
         (count) =>
+          !document.querySelector(
+            '[aria-label="Just Translate 译文"][aria-busy="true"]',
+          ) &&
           document.querySelectorAll('[aria-label="Just Translate 译文"]')
             .length === count,
         expected.length,
@@ -209,12 +212,31 @@ test(
     const firstRequest = once(modelGate, "requested");
     await toggle();
     await firstRequest;
-    const progress = page.locator('[aria-label="Just Translate 翻译状态"]');
-    assert.equal(await progress.isVisible(), true);
-    assert.equal(await progress.getAttribute("aria-busy"), "true");
+    const translationsOnPage = page.locator(
+      '[aria-label="Just Translate 译文"]',
+    );
+    assert.equal(await translationsOnPage.count(), 4);
+    for (const host of await translationsOnPage.all()) {
+      assert.equal(await host.isVisible(), true);
+      assert.equal(await host.getAttribute("aria-busy"), "true");
+    }
+    const belowOriginal = await page.locator("#original").evaluate((node) => {
+      const original = document.createRange();
+      original.selectNodeContents(node.firstChild!);
+      const loading = node
+        .querySelector('[aria-label="Just Translate 译文"]')!
+        .getBoundingClientRect();
+      return loading.top >= original.getBoundingClientRect().bottom;
+    });
     assert.equal(
-      await page.locator('[aria-label="Just Translate 译文"]').count(),
+      belowOriginal,
+      true,
+      "loading occupies the paragraph's translation slot",
+    );
+    assert.equal(
+      await page.locator('[aria-label="Just Translate 翻译状态"]').count(),
       0,
+      "translation must not create a floating progress panel",
     );
     modelGate.emit("release");
     await waitForTranslations([...translations.values()].slice(0, 3));
@@ -242,11 +264,28 @@ test(
       .locator("#original [aria-label='Just Translate 译文']")
       .evaluate((host) => host.remove());
     await waitForTranslations([...translations.values()].slice(0, 3));
+    holdPageRequest = true;
+    const dynamicRequest = once(modelGate, "requested");
     await page.evaluate(() => {
       const paragraph = document.createElement("p");
+      paragraph.id = "dynamic";
       paragraph.textContent = "New paragraphs should appear automatically.";
       document.body.append(paragraph);
     });
+    await dynamicRequest;
+    const dynamicLoading = page.locator(
+      "#dynamic [aria-label='Just Translate 译文']",
+    );
+    assert.equal(await dynamicLoading.isVisible(), true);
+    assert.equal(await dynamicLoading.getAttribute("aria-busy"), "true");
+    assert.equal(
+      await page
+        .locator("#original [aria-label='Just Translate 译文']")
+        .getAttribute("aria-busy"),
+      "false",
+      "loading new content must not reset completed paragraphs",
+    );
+    modelGate.emit("release");
     await waitForTranslations(
       [...translations]
         .filter(([source, translation]) => source !== translation)
@@ -256,12 +295,15 @@ test(
       await page.locator("#same [aria-label='Just Translate 译文']").count(),
       0,
     );
-    assert.deepEqual(requested, [connectionText, ...translations.keys()]);
+    assert.deepEqual(
+      requested.toSorted(),
+      [connectionText, ...translations.keys()].sort(),
+      "each source is requested once, regardless of viewport scheduling",
+    );
     await toggle();
     await page.waitForFunction(
       () => !document.querySelector('[aria-label="Just Translate 译文"]'),
     );
-    assert.equal(await progress.count(), 0);
     assert.equal(
       await page
         .locator("#clamped")
@@ -287,7 +329,10 @@ test(
     });
     // Advance the page's timers without delaying the test in wall-clock time.
     await page.clock.runFor(1000);
-    assert.deepEqual(requested, [connectionText, ...translations.keys()]);
+    assert.deepEqual(
+      requested.toSorted(),
+      [connectionText, ...translations.keys()].sort(),
+    );
 
     // A failed test must not replace the last working toolbar configuration.
     await options.bringToFront();

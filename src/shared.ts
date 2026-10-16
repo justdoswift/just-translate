@@ -1,4 +1,4 @@
-export const APP_VERSION = "0.1.2";
+export const APP_VERSION = "0.1.3";
 export const STARTUP_ERROR_KEY = "justTranslate.startupError";
 export const PROMPT_VERSION = "1";
 export const MAX_BATCH_SEGMENTS = 8;
