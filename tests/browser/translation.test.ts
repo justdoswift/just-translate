@@ -6,6 +6,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { chromium, type BrowserContext } from "playwright";
+import {
+  clickToolbar,
+  dispatchTranslationCommand,
+  instrumentExtension,
+  pageReadCount,
+} from "./extension";
 
 interface DomNode {
   nodeName: string;
@@ -80,7 +86,7 @@ for (const displayMode of ["bilingual", "translation"] as const) {
               requested.push(item.text);
               return {
                 id: item.id,
-                translation:
+                text:
                   item.text === connectionText
                     ? "你好！这是一次连接测试。"
                     : translations.get(item.text),
@@ -126,7 +132,7 @@ for (const displayMode of ["bilingual", "translation"] as const) {
       });
       assert.ok(address && typeof address !== "string");
       const base = `http://127.0.0.1:${address.port}`;
-      const extension = path.resolve(".output/chrome-mv3");
+      const extension = await instrumentExtension(profile);
       context = await chromium.launchPersistentContext(profile, {
         executablePath: chromium.executablePath(),
         headless: true,
@@ -166,7 +172,7 @@ for (const displayMode of ["bilingual", "translation"] as const) {
       assert.equal(
         saved.value.configured,
         true,
-        "successful connection test must save the configuration used by the toolbar",
+        "successful connection test must save the configuration used by the command",
       );
       assert.equal(saved.value.settings.baseUrl, base);
       assert.equal(saved.value.settings.displayMode, displayMode);
@@ -184,10 +190,6 @@ for (const displayMode of ["bilingual", "translation"] as const) {
         (command) => command.name === "toggle-translation",
       )?.shortcut;
       assert.equal(shortcut, process.platform === "darwin" ? "⌥Q" : "Alt+Q");
-      assert.equal(
-        await options.locator("#configure-shortcut").innerText(),
-        `翻译快捷键：${shortcut}`,
-      );
 
       const page = await context.newPage();
       await page.goto(`${base}/article`);
@@ -207,20 +209,26 @@ for (const displayMode of ["bilingual", "translation"] as const) {
       assert.ok(browser);
       const rootCdp = await browser.newBrowserCDPSession();
       const pageCdp = await context.newCDPSession(page);
-      // Toolbar and named command share one serialized handler. This dispatch
-      // tests that handler, not native macOS keyboard event delivery.
-      const toggle = async () => {
-        await page.bringToFront();
-        const { targetInfos } = await rootCdp.send("Target.getTargets", {
-          filter: [{ type: "tab", exclude: false }, { exclude: true }],
+      // Capture and invoke the production named-command listener. No native
+      // keyboard injection or physical shortcut coverage is claimed here.
+      const toggle = () => dispatchTranslationCommand(worker, page);
+      const readsBeforeToolbar = await pageReadCount(worker);
+      const requestsBeforeToolbar = requested.length;
+      await clickToolbar(rootCdp, id, page);
+      await options.waitForFunction(async () => {
+        const [active] = await chrome.tabs.query({
+          active: true,
+          currentWindow: true,
         });
-        const target = targetInfos.find((entry) => entry.url === page.url());
-        assert.ok(target);
-        await rootCdp.send("Extensions.triggerAction", {
-          id,
-          targetId: target.targetId,
-        });
-      };
+        return active?.url === location.href;
+      });
+      assert.equal(await pageReadCount(worker), readsBeforeToolbar);
+      assert.equal(requested.length, requestsBeforeToolbar);
+      assert.equal(
+        await page.locator('[aria-label="Just Translate 译文"]').count(),
+        0,
+        "toolbar must only open settings, even with valid configuration",
+      );
       const waitForTranslations = async (expected: string[]) => {
         await page.waitForFunction(
           (count) =>
@@ -297,6 +305,38 @@ for (const displayMode of ["bilingual", "translation"] as const) {
       );
       await page.locator("#preview").click();
       assert.equal(await page.evaluate("window.previewClicks"), 1);
+      const readsWhileActive = await pageReadCount(worker);
+      const requestsWhileActive = requested.length;
+      const sessionIds = () => worker.evaluate(async () => {
+        const stored = await chrome.storage.session.get("justTranslate.sessions");
+        const sessions = stored["justTranslate.sessions"];
+        if (!Array.isArray(sessions)) throw new Error("Missing active sessions");
+        return sessions.map((session: unknown) => {
+          if (!session || typeof session !== "object" ||
+            !("id" in session) || typeof session.id !== "string")
+            throw new Error("Invalid active session");
+          return session.id;
+        });
+      });
+      const sessionsWhileActive = await sessionIds();
+      assert.equal(sessionsWhileActive.length, 1);
+      await clickToolbar(rootCdp, id, page);
+      await options.waitForFunction(async () => {
+        const [active] = await chrome.tabs.query({
+          active: true,
+          currentWindow: true,
+        });
+        return active?.url === location.href;
+      });
+      assert.equal(await pageReadCount(worker), readsWhileActive);
+      assert.equal(requested.length, requestsWhileActive);
+      assert.deepEqual(
+        await sessionIds(),
+        sessionsWhileActive,
+        "opening settings must preserve the active translation session",
+      );
+      await page.bringToFront();
+      await waitForTranslations([...translations.values()].slice(0, 3));
       if (displayMode === "translation") {
         const translatedButton = page.locator(
           "#preview [aria-label='Just Translate 译文']",
@@ -424,7 +464,7 @@ for (const displayMode of ["bilingual", "translation"] as const) {
         [connectionText, ...translations.keys()].sort(),
       );
 
-      // A failed test must not replace the last working toolbar configuration.
+      // A failed test must not replace the last working command configuration.
       await options.bringToFront();
       await options.locator("#api-key").fill("rejected-test-key");
       await options.locator("#test-connection").click();

@@ -14,7 +14,7 @@ export default defineConfig({
       "http://[::1]/*",
     ],
     action: {
-      default_title: "翻译当前页",
+      default_title: "打开 Just Translate 设置",
       default_icon: {
         16: "icon/16.png",
         32: "icon/32.png",

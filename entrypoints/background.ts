@@ -173,24 +173,24 @@ export default defineBackground(() => {
       running: {
         text: "译",
         color: "#2563eb",
-        title: "正在翻译；再次点击停止并恢复原文",
+        title: "正在翻译；快捷键停止并恢复原文；点击打开设置",
       },
       waiting: {
         text: "✓",
         color: "#15803d",
-        title: "已翻译；滚动或展开后自动补译，再次点击恢复原文",
+        title: "已翻译；滚动或展开后自动补译；快捷键恢复原文；点击打开设置",
       },
       partial: {
         text: "!",
         color: "#b45309",
-        title: "部分段落翻译失败；可在页面上重试",
+        title: "部分段落翻译失败；可在页面上重试；点击打开设置",
       },
       blocked: {
         text: "!",
         color: "#b91c1c",
-        title: "翻译已暂停，请检查设置或用量",
+        title: "翻译已暂停；点击打开设置，检查配置或用量",
       },
-      off: { text: "", color: "#64748b", title: "翻译当前页" },
+      off: { text: "", color: "#64748b", title: "打开 Just Translate 设置" },
     } as const;
     const style = styles[phase];
     try {
@@ -255,7 +255,7 @@ export default defineBackground(() => {
     ) {
       throw new RequestError(
         "stale",
-        "当前页面翻译会话已失效，请点击扩展图标停止后重新开始。",
+        "当前页面翻译会话已失效，请用翻译快捷键停止后重新开始。",
       );
     }
     return session;
@@ -304,7 +304,7 @@ export default defineBackground(() => {
         { frameId: 0 },
       )) as Reply<PageSnapshot>;
     } catch {
-      /* Script is injected only on a user toolbar or command gesture. */
+      /* Script is injected only after the named translation command. */
     }
     if (snapshot?.ok && snapshot.value.active) {
       await chrome.tabs.sendMessage(
@@ -338,7 +338,7 @@ export default defineBackground(() => {
       generation !== (generations.get(tabId) ?? 0) ||
       epoch !== configurationEpoch
     )
-      throw new RequestError("stale", "页面或设置已变化，请再次点击翻译。");
+      throw new RequestError("stale", "页面或设置已变化，请再次使用翻译快捷键。");
     const configurationId = await accountFingerprint(
       JSON.stringify(view.settings),
     );
@@ -346,7 +346,7 @@ export default defineBackground(() => {
       generation !== (generations.get(tabId) ?? 0) ||
       epoch !== configurationEpoch
     )
-      throw new RequestError("stale", "页面或设置已变化，请再次点击翻译。");
+      throw new RequestError("stale", "页面或设置已变化，请再次使用翻译快捷键。");
     const session: TranslationSession = {
       id: crypto.randomUUID(),
       tabId,
@@ -550,7 +550,11 @@ export default defineBackground(() => {
     });
   }
 
-  chrome.action.onClicked.addListener(toggleTranslation);
+  chrome.action.onClicked.addListener(() => {
+    void chrome.runtime.openOptionsPage().catch(() => {
+      // A closing browser may no longer be able to open a settings tab.
+    });
+  });
   chrome.commands.onCommand.addListener((command, tab) => {
     if (command === "toggle-translation") toggleTranslation(tab);
   });
@@ -593,7 +597,7 @@ export default defineBackground(() => {
       .then(() => stop(tabId, "标签页已关闭。", false))
       .catch(() => undefined)
       .finally(() => {
-        // Keep the tombstone through startup restoration and outstanding clicks.
+        // Keep the tombstone through startup restoration and outstanding commands.
         const action = actions.get(tabId);
         if (action) void action.finally(() => generations.delete(tabId));
         else generations.delete(tabId);
