@@ -1,6 +1,7 @@
 import "./style.css";
 import {
   APP_VERSION,
+  STARTUP_ERROR_KEY,
   DEFAULT_SETTINGS,
   LANGUAGES,
   apiOriginPattern,
@@ -137,19 +138,14 @@ async function submitConfiguration(testOnly: boolean): Promise<void> {
   const activeButton = testOnly ? testButton : saveButton;
   const originalLabel = activeButton.textContent;
   activeButton.textContent = testOnly ? "正在测试…" : "正在保存…";
-  feedback(
-    testOnly ? "正在翻译固定测试短句，不会读取当前网页。" : "正在保存配置…",
-  );
+  feedback("");
   try {
     // Must originate in this user gesture, not in a background request.
     const granted = await chrome.permissions.request({
       origins: [apiOriginPattern(settings.baseUrl)],
     });
     if (!granted) {
-      feedback(
-        "未获得模型 API 域名权限。配置尚未保存，请允许访问后重试。",
-        "error",
-      );
+      feedback("未获得 API 域名权限。", "error");
       return;
     }
     if (testOnly) {
@@ -163,10 +159,7 @@ async function submitConfiguration(testOnly: boolean): Promise<void> {
         feedback(reply.error.message, "error");
       } else {
         setConnectionState("连接正常", "ready");
-        feedback(
-          `测试译文：${reply.value.translation}。修改后的配置仍需保存。`,
-          "success",
-        );
+        feedback(reply.value.translation, "success");
       }
       await refreshUsage();
     } else {
@@ -184,17 +177,14 @@ async function submitConfiguration(testOnly: boolean): Promise<void> {
         type: "settings:get",
       });
       if (!persisted.ok) {
-        feedback("保存请求已完成，但无法重新读取配置。请刷新后确认。", "error");
+        feedback("保存后无法读取配置，请刷新确认。", "error");
         return;
       }
       populate(persisted.value);
-      feedback(
-        "设置已保存。回到网页，点击工具栏中的 Just Translate 图标即可翻译。",
-        "success",
-      );
+      feedback("已保存", "success");
     }
   } catch {
-    feedback("无法完成操作。输入内容已保留，请检查扩展权限后重试。", "error");
+    feedback("操作失败，请检查扩展权限。", "error");
   } finally {
     busy = false;
     fields.disabled = false;
@@ -221,14 +211,12 @@ async function refreshUsage(): Promise<void> {
     element("cache-count").textContent =
       `本机缓存 ${number.format(cacheEntries)} 段译文`;
     element("usage-title").textContent = `${usage.month} 用量`;
-    const notes = ["费用按配置单价估算，以供应商账单为准。"];
+    const counts: string[] = [];
     if (usage.estimatedRequests)
-      notes.push(`${usage.estimatedRequests} 次请求的 token 为本地估算。`);
+      counts.push(`估算请求 ${number.format(usage.estimatedRequests)}`);
     if (usage.uncertainRequests)
-      notes.push(
-        `${usage.uncertainRequests} 次请求的计费结果未确认，可能仍有费用。`,
-      );
-    element("usage-note").textContent = notes.join(" ");
+      counts.push(`未确认请求 ${number.format(usage.uncertainRequests)}`);
+    element("usage-note").textContent = counts.join(" · ");
   } finally {
     button.disabled = false;
   }
@@ -254,7 +242,7 @@ testButton.addEventListener("click", () => void submitConfiguration(true));
 form.addEventListener("input", () => {
   baseUrlInput.setCustomValidity("");
   keyInput.setCustomValidity("");
-  if (initialized && !busy) feedback("有未保存的修改。");
+  if (initialized && !busy) feedback("未保存");
 });
 form
   .querySelectorAll<HTMLInputElement>('input[name="provider"]')
@@ -274,7 +262,7 @@ form
         ? String(DEFAULT_SETTINGS.outputPricePerMillion)
         : "0";
       setConnectionState("尚未测试");
-      feedback("已切换服务商。请填写对应密钥；自定义模型请同时填写计费单价。");
+      feedback("未保存");
     });
   });
 baseUrlInput.addEventListener("change", () => {
@@ -282,7 +270,7 @@ baseUrlInput.addEventListener("change", () => {
     const origin = new URL(normalizeBaseUrl(baseUrlInput.value)).origin;
     if (keyOrigin && keyOrigin !== origin) {
       keyInput.value = "";
-      feedback("API 域名已改变。为避免误发密钥，请重新填写该服务的 API Key。");
+      feedback("请重新输入 API Key。");
     }
     keyOrigin = origin;
   } catch {
@@ -298,8 +286,7 @@ element<HTMLButtonElement>("show-key").addEventListener("click", (event) => {
 });
 element("refresh-usage").addEventListener("click", () => void refreshUsage());
 element("clear-cache").addEventListener("click", async () => {
-  if (!window.confirm("清除所有会话及本机持久译文缓存？模型配置和密钥会保留。"))
-    return;
+  if (!window.confirm("清除译文缓存？")) return;
   const button = element<HTMLButtonElement>("clear-cache");
   button.disabled = true;
   try {
@@ -311,8 +298,7 @@ element("clear-cache").addEventListener("click", async () => {
       return;
     }
     await refreshUsage();
-    element("usage-note").textContent =
-      `已清除 ${reply.value.cleared} 段缓存，模型配置与密钥未改变。`;
+    element("usage-note").textContent = `已清除 ${reply.value.cleared} 段缓存`;
   } finally {
     button.disabled = false;
   }
@@ -323,7 +309,27 @@ for (const language of LANGUAGES) {
 }
 element("version").textContent = APP_VERSION;
 
+function showStartupError(value: unknown): void {
+  const message =
+    value &&
+    typeof value === "object" &&
+    "message" in value &&
+    typeof value.message === "string"
+      ? value.message
+      : "";
+  element("startup-error-message").textContent = message;
+  element("startup-error").hidden = !message;
+}
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "session" && STARTUP_ERROR_KEY in changes) {
+    showStartupError(changes[STARTUP_ERROR_KEY]?.newValue);
+  }
+});
+
 async function initialize(): Promise<void> {
+  const startup = await chrome.storage.session.get(STARTUP_ERROR_KEY);
+  showStartupError(startup[STARTUP_ERROR_KEY]);
   const result = await sendMessage<SettingsView>({ type: "settings:get" });
   if (!result.ok) {
     feedback(result.error.message, "error");
@@ -333,11 +339,7 @@ async function initialize(): Promise<void> {
   populate(result.value);
   initialized = true;
   fields.disabled = false;
-  feedback(
-    result.value.configured
-      ? "配置已读取。你可以直接回到网页开始翻译。"
-      : "填入 API Key，即可连接自己的翻译模型。",
-  );
+  feedback("");
   await refreshUsage();
 }
 

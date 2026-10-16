@@ -25,15 +25,24 @@ npm run build
 
 快捷键为 `Alt+Shift+J`；macOS 对应 `Option+Shift+J`。若与其他快捷键冲突，可在 `chrome://extensions/shortcuts` 修改。它与工具栏图标执行同一个开关操作。
 
+## 0.1.1 修复
+
+- 移除内容脚本的全站 `matches`。WXT 曾把它转换为必需的全站访问权限，与可选 API 权限冲突。现在仅在点击图标后使用 `activeTab` 注入。
+- 启动失败时打开设置页并显示具体原因，不再仅显示红色 `!`。保存配置或成功启动后清除这条提示。
+- 新增真实 Chrome 权限回归测试：点击前不能读取网页，点击后只能读取获准的标签页。
+- 清除设置页说明段落、字段注释和宣传文案，仅保留字段、操作、实际状态、测试译文与错误。
+
+从 0.1.0 更新后，在扩展管理页重新加载插件，确认版本为 0.1.1。若 API 权限需要重新授予，打开选项并保存设置；不要在 Chrome 扩展管理页本身点击翻译。
+
 ## 模型配置
 
-| 配置 | DeepSeek 预设 | 自定义 OpenAI 兼容服务 |
-| --- | --- | --- |
-| API 基础地址 | `https://api.deepseek.com` | 例如 `https://your-provider.example/v1` |
-| 模型名称 | `deepseek-flash` | 服务商实际支持的模型 ID |
-| API Key | 自己的 DeepSeek Key | 自己的服务商 Key |
-| JSON 模式 | 开启 | 默认关闭；确认接口支持后再开启 |
-| 关闭思考模式 | 开启 | 默认关闭；只在支持 `thinking.type=disabled` 时开启 |
+| 配置         | DeepSeek 预设              | 自定义 OpenAI 兼容服务                             |
+| ------------ | -------------------------- | -------------------------------------------------- |
+| API 基础地址 | `https://api.deepseek.com` | 例如 `https://your-provider.example/v1`            |
+| 模型名称     | `deepseek-flash`           | 服务商实际支持的模型 ID                            |
+| API Key      | 自己的 DeepSeek Key        | 自己的服务商 Key                                   |
+| JSON 模式    | 开启                       | 默认关闭；确认接口支持后再开启                     |
+| 关闭思考模式 | 开启                       | 默认关闭；只在支持 `thinking.type=disabled` 时开启 |
 
 基础地址后会追加 `/chat/completions`，不要自行填写这个后缀。远程接口必须使用 HTTPS；允许 `localhost`、`127.0.0.1` 和 `[::1]` 的本机 HTTP 接口。本机服务若不校验密钥，可填入无敏感信息的占位值。
 
@@ -94,6 +103,13 @@ npm run build
 
 `npm run dev` 使用 WXT 开发模式；安装交付包使用生产构建目录。
 
+浏览器权限回归测试使用独立的临时 Chrome 配置，不读取个人浏览器数据：
+
+```sh
+npx playwright install chromium
+npm run test:chrome
+```
+
 目录职责：
 
 - `entrypoints/background.ts`：工具栏开关、消息权限、文档会话生命周期。
@@ -102,9 +118,9 @@ npm run build
 - `entrypoints/options/`：模型、语言、缓存及用量设置。
 - `tests/`：接口错误、预算并发、请求恢复、缓存失效及导航回归测试。
 
-0.1.0 已通过 TypeScript 检查、15 项行为测试及生产构建。Chrome for Testing 156 中已实测一键开关、动态插入、展开、锚点跳转、正文容器替换、过期响应丢弃、停止后迟到响应、后台重启、失败段落重试、429 有界重试、预算阻止发送和标签页隔离。
+0.1.1 已通过 TypeScript 检查、15 项行为测试、一项真实 Chrome 权限回归及生产构建。隔离 Chrome 中确认安装警告、Manifest 错误和运行错误为空，并验证了 API 域名授权、普通 HTTPS 网页翻译、动态补译和鉴权失败后的单段重试。
 
-浏览器验证使用本机受控 OpenAI 兼容测试服务；没有使用用户的真实 API Key，未产生或验证付费 DeepSeek 请求。首次使用请在设置页测试自己的连接。
+自动化回归使用本机受控 OpenAI 兼容测试服务。经所有者授权，另使用真实 DeepSeek API 验证了连接、段落翻译、行内代码保留和新增内容补译；密钥仅用于隔离浏览器会话，不进入源码或 Git。不同服务商仍需在设置页测试自己的连接。
 
 ## 开源许可
 

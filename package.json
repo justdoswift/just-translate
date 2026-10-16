@@ -1,6 +1,6 @@
 {
   "name": "just-translate",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "使用自己的 DeepSeek 或 OpenAI 兼容 API，一键双语翻译网页并自动补译动态内容。",
   "license": "MIT",
@@ -23,6 +23,7 @@
     "zip": "wxt zip",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
+    "test:chrome": "npm run build && node --import tsx --test tests/browser/*.test.ts",
     "postinstall": "wxt prepare"
   },
   "devDependencies": {

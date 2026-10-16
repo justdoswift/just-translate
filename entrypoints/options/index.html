@@ -18,17 +18,21 @@
       </header>
       <main>
         <div class="intro">
-          <div>
-            <p class="eyebrow">你的模型，你的阅读方式</p>
-            <h1>翻译设置</h1>
-            <p class="lead">
-              连接 AI 模型，回到网页点击插件图标，即可开始双语阅读。
-            </p>
-          </div>
+          <h1>翻译设置</h1>
           <span id="connection-state" class="state" role="status"
             >读取配置中</span
           >
         </div>
+        <section
+          id="startup-error"
+          class="startup-error"
+          role="alert"
+          aria-labelledby="startup-error-title"
+          hidden
+        >
+          <h2 id="startup-error-title">上次翻译未能启动</h2>
+          <p id="startup-error-message"></p>
+        </section>
         <form id="settings-form" autocomplete="off">
           <fieldset id="settings-fields" disabled>
             <section class="section" aria-labelledby="connection-title">
@@ -36,7 +40,6 @@
                 <span class="section-number" aria-hidden="true">01</span>
                 <div>
                   <h2 id="connection-title">模型连接</h2>
-                  <p>直接连接服务商，不经过 Just Translate 中转。</p>
                 </div>
               </div>
               <div class="section-body">
@@ -49,13 +52,13 @@
                         name="provider"
                         value="deepseek"
                         checked
-                      /><span>DeepSeek</span><small>预设配置</small></label
+                      /><span>DeepSeek</span></label
                     ><label class="provider-option"
                       ><input
                         type="radio"
                         name="provider"
                         value="custom"
-                      /><span>自定义接口</span><small>OpenAI 兼容</small></label
+                      /><span>OpenAI 兼容</span></label
                     >
                   </div>
                 </fieldset>
@@ -67,12 +70,7 @@
                       required
                       spellcheck="false"
                       placeholder="https://api.deepseek.com"
-                      aria-describedby="url-help"
-                    /><small id="url-help"
-                      >支持 HTTPS；本机服务可使用 HTTP。不要填写
-                      /chat/completions。</small
-                    ></label
-                  >
+                  /></label>
                   <label class="field"
                     >模型名称<input
                       id="model"
@@ -81,8 +79,7 @@
                       maxlength="150"
                       spellcheck="false"
                       placeholder="deepseek-flash"
-                    /><small>可填写服务商支持的模型名称。</small></label
-                  >
+                  /></label>
                 </div>
                 <label class="field" for="api-key">API Key</label>
                 <div class="key-field">
@@ -92,7 +89,6 @@
                     spellcheck="false"
                     autocomplete="off"
                     required
-                    aria-describedby="key-help"
                     placeholder="输入你的 API Key"
                   /><button
                     id="show-key"
@@ -104,14 +100,9 @@
                     显示
                   </button>
                 </div>
-                <p id="key-help" class="field-help">
-                  密钥只由扩展后台使用，不交给网页，也不通过浏览器同步。
-                </p>
                 <label class="check-row"
                   ><input id="remember-key" type="checkbox" /><span
-                    >在本机记住密钥<small
-                      >默认仅保留本次浏览器会话。本机存储不是加密保险箱。</small
-                    ></span
+                    >在本机记住密钥</span
                   ></label
                 >
                 <details class="advanced">
@@ -119,16 +110,11 @@
                   <div class="detail-body">
                     <label class="check-row"
                       ><input id="json-mode" type="checkbox" /><span
-                        >启用 JSON 输出模式<small
-                          >服务商不支持 response_format 时关闭。</small
-                        ></span
+                        >JSON 输出</span
                       ></label
                     ><label class="check-row"
                       ><input id="disable-thinking" type="checkbox" /><span
-                        >发送关闭思考模式参数<small
-                          >DeepSeek 使用 thinking:
-                          disabled。其他接口仅在确认支持时开启。</small
-                        ></span
+                        >关闭思考模式</span
                       ></label
                     >
                   </div>
@@ -140,22 +126,12 @@
                 <span class="section-number" aria-hidden="true">02</span>
                 <div>
                   <h2 id="reading-title">阅读偏好</h2>
-                  <p>保留原文，在段落下方显示译文。</p>
                 </div>
               </div>
               <div class="section-body">
                 <label class="field language-field"
                   >翻译为<select id="target-language"></select
                 ></label>
-                <div class="reading-note">
-                  <span class="note-mark" aria-hidden="true">A / 文</span>
-                  <p>
-                    点击图标开启，再次点击停止并恢复原文。滚动和展开后，新加载的内容会自动接着翻译。
-                  </p>
-                </div>
-                <p class="privacy-note">
-                  开启后，当前正文及后续加载的正文会发送给所选模型服务商。请勿在含有私密资料的页面随意开启。
-                </p>
               </div>
             </section>
             <section class="section" aria-labelledby="data-title">
@@ -163,15 +139,12 @@
                 <span class="section-number" aria-hidden="true">03</span>
                 <div>
                   <h2 id="data-title">缓存与费用</h2>
-                  <p>同样的内容不反复翻译；用量始终看得见。</p>
                 </div>
               </div>
               <div class="section-body">
                 <label class="check-row"
                   ><input id="persistent-cache" type="checkbox" /><span
-                    >在本机持久保存译文<small
-                      >适用于所有手动翻译的站点；默认只使用会话缓存。</small
-                    ></span
+                    >持久缓存</span
                   ></label
                 >
                 <div class="field-grid compact-grid">
@@ -185,15 +158,14 @@
                       required
                   /></label>
                   <label class="field"
-                    >每月费用提醒阈值（USD）<input
+                    >月度费用上限（USD）<input
                       id="monthly-budget"
                       type="number"
                       min="0"
                       max="10000"
                       step="0.01"
                       required
-                    /><small>达到后停止新请求，0 表示不限制。</small></label
-                  >
+                  /></label>
                 </div>
                 <details class="advanced">
                   <summary>计费估算与单页限制</summary>
@@ -218,32 +190,20 @@
                       /></label>
                     </div>
                     <label class="field language-field"
-                      >单页 token 阈值<input
+                      >单页 token 上限<input
                         id="page-token-limit"
                         type="number"
                         min="0"
                         max="10000000"
                         step="1"
                         required
-                      /><small>包含输入和输出；0 表示不限制。</small></label
-                    >
-                    <p class="field-help">
-                      费用按上方单价估算，不是供应商账单。其他软件的消费不在此统计范围内。默认单价参考
-                      <a
-                        href="https://api-docs.deepseek.com/quick_start/pricing"
-                        target="_blank"
-                        rel="noreferrer"
-                        >DeepSeek 官方价格</a
-                      >，请按实际模型调整。
-                    </p>
+                    /></label>
                   </div>
                 </details>
               </div>
             </section>
             <div class="actions">
-              <p id="form-status" role="status" aria-live="polite">
-                配置读取后即可编辑。
-              </p>
+              <p id="form-status" role="status" aria-live="polite"></p>
               <div class="action-buttons">
                 <button
                   id="test-connection"
@@ -260,10 +220,6 @@
                 </button>
               </div>
             </div>
-            <p class="action-help">
-              测试连接会翻译一小段固定文字，产生少量 API
-              费用。保存连接配置会停止正在运行的翻译。
-            </p>
           </fieldset>
         </form>
         <section class="usage-section" aria-labelledby="usage-title">
@@ -287,7 +243,7 @@
               <dd id="usage-requests">—</dd>
             </div>
           </dl>
-          <p id="usage-note" class="field-help" role="status">读取用量中。</p>
+          <p id="usage-note" class="usage-status" role="status"></p>
           <div class="cache-actions">
             <span id="cache-count">—</span
             ><button id="clear-cache" type="button" class="text-button">
@@ -295,9 +251,6 @@
             </button>
           </div>
         </section>
-        <footer>
-          只翻译，不打扰。<span>无账号 · 无中转 · 无划词浮窗</span>
-        </footer>
       </main>
     </div>
     <script type="module" src="./main.ts"></script>

@@ -117,7 +117,7 @@ button:active:not(:disabled) {
   color: var(--muted);
 }
 main {
-  padding: 42px 0 0;
+  padding: 32px 0 40px;
 }
 .intro {
   display: flex;
@@ -127,22 +127,11 @@ main {
   margin-bottom: 32px;
   animation: enter 0.3s ease-out;
 }
-.eyebrow {
-  font-size: 12px;
-  letter-spacing: 1.2px;
-  color: var(--muted);
-  margin-bottom: 7px;
-}
 h1 {
   font-size: 34px;
   letter-spacing: -1.3px;
   font-weight: 650;
   line-height: 1.3;
-}
-.lead {
-  color: var(--muted);
-  margin-top: 12px;
-  max-width: 590px;
 }
 .state {
   white-space: nowrap;
@@ -160,6 +149,21 @@ h1 {
 .state[data-state="error"] {
   color: var(--error);
   border-color: var(--error);
+}
+.startup-error {
+  margin-bottom: 24px;
+  padding: 20px 24px;
+  border: 1px solid var(--error);
+  border-radius: 12px;
+  background: var(--surface);
+  overflow-wrap: anywhere;
+}
+.startup-error h2 {
+  font-size: 16px;
+  color: var(--error);
+}
+.startup-error p {
+  margin-top: 8px;
 }
 .section {
   display: grid;
@@ -187,12 +191,6 @@ h2 {
   font-size: 17px;
   font-weight: 650;
   letter-spacing: -0.3px;
-}
-.section-heading p {
-  color: var(--muted);
-  font-size: 12px;
-  margin-top: 8px;
-  max-width: 145px;
 }
 .section-body {
   min-width: 0;
@@ -229,13 +227,6 @@ h2 {
 .provider-option span {
   font-size: 14px;
   font-weight: 600;
-}
-.provider-option small {
-  display: block;
-  width: 100%;
-  padding-left: 23px;
-  color: var(--muted);
-  font-size: 11px;
 }
 .provider-option input {
   margin: 0;
@@ -275,8 +266,7 @@ h2 {
 .key-field input:focus {
   border-color: var(--accent);
 }
-.field small,
-.field-help {
+.usage-status {
   font-size: 12px;
   font-weight: 400;
   line-height: 1.65;
@@ -338,13 +328,6 @@ h2 {
   margin: 3px 0 0;
   accent-color: var(--accent);
 }
-.check-row small {
-  display: block;
-  font-size: 12px;
-  line-height: 1.65;
-  color: var(--muted);
-  margin-top: 4px;
-}
 .advanced {
   border-top: 1px solid var(--border);
   margin-top: 18px;
@@ -364,29 +347,6 @@ h2 {
 }
 .language-field {
   max-width: 270px;
-}
-.reading-note {
-  display: flex;
-  gap: 15px;
-  align-items: center;
-  margin: 6px 0 16px;
-  padding: 16px 0;
-  border-top: 1px solid var(--border);
-  border-bottom: 1px solid var(--border);
-}
-.note-mark {
-  white-space: nowrap;
-  color: var(--accent);
-  font-family: Georgia, serif;
-  font-size: 21px;
-}
-.reading-note p {
-  font-size: 13px;
-  color: var(--fg);
-}
-.privacy-note {
-  font-size: 12px;
-  color: var(--muted);
 }
 .actions {
   border: 1px solid var(--border);
@@ -439,11 +399,6 @@ h2 {
 .secondary:hover {
   background: var(--bg);
 }
-.action-help {
-  font-size: 11px;
-  color: var(--muted);
-  padding: 12px 0 0;
-}
 .usage-section {
   margin-top: 40px;
   padding-top: 24px;
@@ -476,16 +431,6 @@ h2 {
 .cache-actions {
   margin-top: 12px;
   font-size: 12px;
-  color: var(--muted);
-}
-footer {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 30px 0 28px;
-  margin-top: 30px;
-  border-top: 1px solid var(--border);
-  font-size: 11px;
   color: var(--muted);
 }
 @keyframes enter {
@@ -544,10 +489,6 @@ footer {
     padding: 24px;
     gap: 20px;
   }
-  .section-heading p {
-    max-width: none;
-    margin-top: 3px;
-  }
   .section-heading {
     gap: 10px;
   }
@@ -561,9 +502,6 @@ footer {
   }
   .usage-grid dd {
     font-size: 19px;
-  }
-  .lead {
-    font-size: 13px;
   }
 }
 @media (max-width: 460px) {
@@ -587,9 +525,6 @@ footer {
   .provider-option {
     padding: 10px;
   }
-  .provider-option small {
-    font-size: 10px;
-  }
   .usage-grid {
     grid-template-columns: 1fr;
     gap: 15px;
@@ -608,10 +543,6 @@ footer {
   }
   .action-buttons {
     width: 100%;
-  }
-  footer {
-    flex-direction: column;
-    gap: 4px;
   }
 }
 @media (prefers-reduced-motion: reduce) {

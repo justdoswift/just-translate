@@ -3,7 +3,8 @@ import { installContentController } from "../src/content/controller";
 
 export default defineContentScript({
   registration: "runtime",
-  matches: ["http://*/*", "https://*/*"],
+  // Inject only after a toolbar gesture using activeTab. Runtime `matches`
+  // would make WXT request permanent access to every matching website.
   runAt: "document_idle",
   main() {
     // This property belongs to the extension's isolated world, not the site's window.

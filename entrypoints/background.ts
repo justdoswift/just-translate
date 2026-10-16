@@ -1,5 +1,6 @@
 import { defineBackground } from "wxt/utils/define-background";
 import {
+  STARTUP_ERROR_KEY,
   type BackgroundMessage,
   type PageMessage,
   type PageProgress,
@@ -318,13 +319,8 @@ export default defineBackground(() => {
       return;
     }
     const view = settings.view();
-    try {
-      validateKey(view.apiKey);
-      await requireApiPermission(view.settings);
-    } catch (error) {
-      await chrome.runtime.openOptionsPage();
-      throw error;
-    }
+    validateKey(view.apiKey);
+    await requireApiPermission(view.settings);
     const injection = snapshot?.ok
       ? await chrome.scripting.executeScript({
           target: { tabId, frameIds: [0] },
@@ -385,6 +381,7 @@ export default defineBackground(() => {
         );
       if (sessions.get(tabId) !== session) return;
       await badge(tabId, "running");
+      await chrome.storage.session.remove(STARTUP_ERROR_KEY);
     } catch (error) {
       if (sessions.get(tabId) === session)
         await stop(tabId, "页面脚本未能启动。");
@@ -468,6 +465,7 @@ export default defineBackground(() => {
         );
         const result = await settings.save(next, key);
         await state.configure(next);
+        await chrome.storage.session.remove(STARTUP_ERROR_KEY);
         return result;
       });
       configuration = operation.catch(() => undefined);
@@ -513,7 +511,23 @@ export default defineBackground(() => {
     const action = previous
       .then(() => startOrStop(tabId))
       .catch(async (error: unknown) => {
-        await badge(tabId, "blocked", errorDetail(error).message);
+        const detail = errorDetail(error);
+        if (detail.code === "internal" && error instanceof Error) {
+          // Startup errors come from Chrome APIs, not model responses. Keep
+          // their diagnostic reason, but do not store the current page URL.
+          detail.message = `无法启动翻译：${error.message.replace(/(?:https?|chrome-extension):\/\/\S+/g, "[页面地址]").slice(0, 250)}`;
+        }
+        await badge(tabId, "blocked", detail.message);
+        try {
+          await chrome.storage.session.set({ [STARTUP_ERROR_KEY]: detail });
+        } catch {
+          // The toolbar title remains available if session storage fails.
+        }
+        try {
+          await chrome.runtime.openOptionsPage();
+        } catch {
+          // A closing browser may no longer be able to open a settings tab.
+        }
       });
     actions.set(tabId, action);
     void action.finally(() => {
