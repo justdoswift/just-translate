@@ -114,7 +114,7 @@ function collectSettings(): Settings {
   };
 }
 
-async function submitConfiguration(testOnly: boolean): Promise<void> {
+async function submitConfiguration(testConnection: boolean): Promise<void> {
   if (busy || !form.reportValidity()) return;
   let settings: Settings;
   try {
@@ -135,9 +135,9 @@ async function submitConfiguration(testOnly: boolean): Promise<void> {
   }
   busy = true;
   fields.disabled = true;
-  const activeButton = testOnly ? testButton : saveButton;
+  const activeButton = testConnection ? testButton : saveButton;
   const originalLabel = activeButton.textContent;
-  activeButton.textContent = testOnly ? "正在测试…" : "正在保存…";
+  activeButton.textContent = testConnection ? "正在测试…" : "正在保存…";
   feedback("");
   try {
     // Must originate in this user gesture, not in a background request.
@@ -148,41 +148,43 @@ async function submitConfiguration(testOnly: boolean): Promise<void> {
       feedback("未获得 API 域名权限。", "error");
       return;
     }
-    if (testOnly) {
+    let translation: string | undefined;
+    if (testConnection) {
       const reply = await sendMessage<{ translation: string }>({
         type: "connection:test",
         settings,
         apiKey,
       });
+      await refreshUsage();
       if (!reply.ok) {
         setConnectionState("连接失败", "error");
         feedback(reply.error.message, "error");
-      } else {
-        setConnectionState("连接正常", "ready");
-        feedback(reply.value.translation, "success");
-      }
-      await refreshUsage();
-    } else {
-      const reply = await sendMessage<SettingsView>({
-        type: "settings:save",
-        settings,
-        apiKey,
-      });
-      if (!reply.ok) {
-        feedback(reply.error.message, "error");
         return;
       }
-      // Read back the saved state, rather than displaying the outgoing payload as success.
-      const persisted = await sendMessage<SettingsView>({
-        type: "settings:get",
-      });
-      if (!persisted.ok) {
-        feedback("保存后无法读取配置，请刷新确认。", "error");
-        return;
-      }
-      populate(persisted.value);
-      feedback("已保存", "success");
+      translation = reply.value.translation;
+      activeButton.textContent = "正在保存…";
     }
+    const reply = await sendMessage<SettingsView>({
+      type: "settings:save",
+      settings,
+      apiKey,
+    });
+    if (!reply.ok) {
+      setConnectionState("保存失败", "error");
+      feedback(reply.error.message, "error");
+      return;
+    }
+    // Read back the saved state, rather than displaying the outgoing payload as success.
+    const persisted = await sendMessage<SettingsView>({
+      type: "settings:get",
+    });
+    if (!persisted.ok) {
+      feedback("保存后无法读取配置，请刷新确认。", "error");
+      return;
+    }
+    populate(persisted.value);
+    if (testConnection) setConnectionState("连接正常", "ready");
+    feedback(translation ?? "已保存", "success");
   } catch {
     feedback("操作失败，请检查扩展权限。", "error");
   } finally {
@@ -307,6 +309,30 @@ element("clear-cache").addEventListener("click", async () => {
 for (const language of LANGUAGES) {
   languageSelect.add(new Option(language.label, language.value));
 }
+
+const shortcutButton = element<HTMLButtonElement>("configure-shortcut");
+async function refreshShortcut(): Promise<void> {
+  try {
+    const commands = await chrome.commands.getAll();
+    const shortcut = commands.find(
+      (command) => command.name === "toggle-translation",
+    )?.shortcut;
+    shortcutButton.textContent = `翻译快捷键：${shortcut || "未设置"}`;
+  } catch {
+    shortcutButton.textContent = "翻译快捷键：读取失败";
+  }
+}
+shortcutButton.addEventListener("click", () => {
+  void chrome.tabs
+    .create({ url: "chrome://extensions/shortcuts" })
+    .catch(() => feedback("无法打开快捷键设置。", "error"));
+});
+window.addEventListener("focus", () => void refreshShortcut());
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) void refreshShortcut();
+});
+void refreshShortcut();
+
 element("version").textContent = APP_VERSION;
 
 function showStartupError(value: unknown): void {

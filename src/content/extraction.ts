@@ -1,9 +1,9 @@
 import { MAX_SEGMENT_CHARS } from "../shared";
 
 export const BLOCK_SELECTOR =
-  "p,h1,h2,h3,h4,h5,h6,li,blockquote,td,th,dd,dt,figcaption,caption,article,main,section,div";
+  "p,h1,h2,h3,h4,h5,h6,li,blockquote,td,th,dd,dt,figcaption,caption,article,main,section,div,button";
 const EXCLUDED_SELECTOR =
-  'nav,button,form,input,textarea,select,option,pre,script,style,noscript,template,svg,math,iframe,canvas,video,audio,[role="navigation"],[role="menu"],[role="menubar"],[role="toolbar"],[role="button"],[role="textbox"],[contenteditable]:not([contenteditable="false"]),[translate="no"],.notranslate';
+  'nav,form,input,textarea,select,option,pre,script,style,noscript,template,svg,math,iframe,canvas,video,audio,[role="navigation"],[role="menu"],[role="menubar"],[role="toolbar"],[role="textbox"],[contenteditable]:not([contenteditable="false"]),[translate="no"],.notranslate';
 const CODE_TOKEN = /⟦JT_CODE_\d+⟧/g;
 const BLOCK_DISPLAYS: Record<string, true> = {
   block: true,

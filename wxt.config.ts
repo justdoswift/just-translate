@@ -23,9 +23,9 @@ export default defineConfig({
       },
     },
     commands: {
-      _execute_action: {
-        suggested_key: { default: "Alt+Shift+J" },
-        description: "开启翻译或恢复原文",
+      "toggle-translation": {
+        suggested_key: { default: "Alt+Q", mac: "Alt+Q" },
+        description: "切换原文 / 译文",
       },
     },
     icons: {

@@ -3,7 +3,7 @@ import { installContentController } from "../src/content/controller";
 
 export default defineContentScript({
   registration: "runtime",
-  // Inject only after a toolbar gesture using activeTab. Runtime `matches`
+  // Inject only after a toolbar/shortcut gesture using activeTab. Runtime `matches`
   // would make WXT request permanent access to every matching website.
   runAt: "document_idle",
   main() {

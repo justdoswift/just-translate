@@ -304,7 +304,7 @@ export default defineBackground(() => {
         { frameId: 0 },
       )) as Reply<PageSnapshot>;
     } catch {
-      /* Script is injected only on a user toolbar gesture. */
+      /* Script is injected only on a user toolbar or command gesture. */
     }
     if (snapshot?.ok && snapshot.value.active) {
       await chrome.tabs.sendMessage(
@@ -504,35 +504,54 @@ export default defineBackground(() => {
     },
   );
 
-  chrome.action.onClicked.addListener((tab) => {
+  async function reportStartupError(
+    error: unknown,
+    tabId?: number,
+  ): Promise<void> {
+    const detail = errorDetail(error);
+    if (detail.code === "internal" && error instanceof Error) {
+      // Startup errors come from Chrome APIs, not model responses. Keep
+      // their diagnostic reason, but do not store the current page URL.
+      detail.message = `无法启动翻译：${error.message.replace(/(?:https?|chrome-extension):\/\/\S+/g, "[页面地址]").slice(0, 250)}`;
+    }
+    if (tabId !== undefined) await badge(tabId, "blocked", detail.message);
+    try {
+      await chrome.storage.session.set({ [STARTUP_ERROR_KEY]: detail });
+    } catch {
+      // The toolbar title remains available if session storage fails.
+    }
+    try {
+      await chrome.runtime.openOptionsPage();
+    } catch {
+      // A closing browser may no longer be able to open a settings tab.
+    }
+  }
+
+  function toggleTranslation(tab?: chrome.tabs.Tab): void {
+    if (!tab) {
+      void chrome.tabs
+        .query({ active: true, currentWindow: true })
+        .then(([activeTab]) => {
+          if (activeTab) toggleTranslation(activeTab);
+        })
+        .catch((error: unknown) => reportStartupError(error));
+      return;
+    }
     if (tab.id === undefined) return;
     const tabId = tab.id;
     const previous = actions.get(tabId) ?? Promise.resolve();
     const action = previous
       .then(() => startOrStop(tabId))
-      .catch(async (error: unknown) => {
-        const detail = errorDetail(error);
-        if (detail.code === "internal" && error instanceof Error) {
-          // Startup errors come from Chrome APIs, not model responses. Keep
-          // their diagnostic reason, but do not store the current page URL.
-          detail.message = `无法启动翻译：${error.message.replace(/(?:https?|chrome-extension):\/\/\S+/g, "[页面地址]").slice(0, 250)}`;
-        }
-        await badge(tabId, "blocked", detail.message);
-        try {
-          await chrome.storage.session.set({ [STARTUP_ERROR_KEY]: detail });
-        } catch {
-          // The toolbar title remains available if session storage fails.
-        }
-        try {
-          await chrome.runtime.openOptionsPage();
-        } catch {
-          // A closing browser may no longer be able to open a settings tab.
-        }
-      });
+      .catch((error: unknown) => reportStartupError(error, tabId));
     actions.set(tabId, action);
     void action.finally(() => {
       if (actions.get(tabId) === action) actions.delete(tabId);
     });
+  }
+
+  chrome.action.onClicked.addListener(toggleTranslation);
+  chrome.commands.onCommand.addListener((command, tab) => {
+    if (command === "toggle-translation") toggleTranslation(tab);
   });
 
   chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {

@@ -21,7 +21,12 @@ import {
   type ExtractedSource,
 } from "./extraction";
 import { observeNavigation, type NavigationWatch } from "./navigation";
-import { createTranslationView, type TranslationView } from "./renderer";
+import {
+  createProgressView,
+  createTranslationView,
+  type ProgressView,
+  type TranslationView,
+} from "./renderer";
 
 interface Task {
   segment: Segment;
@@ -80,6 +85,7 @@ class PageSession {
   private readonly blocks = new Map<Element, Block>();
   private readonly queue = new Set<Task>();
   private readonly owned = new WeakSet<Node>();
+  private readonly viewOwners = new WeakMap<Node, Block>();
   private readonly dirty = new Map<
     Element,
     { due: number; subtree: boolean }
@@ -90,6 +96,7 @@ class PageSession {
   private readonly observer: MutationObserver;
   private readonly intersection: IntersectionObserver;
   private readonly navigation: NavigationWatch;
+  private readonly progressView: ProgressView;
   private scanTimer?: number;
   private progressTimer?: number;
   private pumpTimer?: number;
@@ -116,6 +123,10 @@ class PageSession {
       { rootMargin: "250px" },
     );
     this.navigation = observeNavigation((reason) => this.stop(reason));
+    this.progressView = createProgressView(
+      () => this.stop("用户恢复原文。"),
+      (node) => this.owned.add(node),
+    );
     // Observe before the initial scan so hydration and lazy insertion cannot fall through a gap.
     this.observer.observe(document.documentElement, {
       subtree: true,
@@ -143,6 +154,7 @@ class PageSession {
     this.observer.disconnect();
     this.intersection.disconnect();
     this.navigation.disconnect();
+    this.progressView.remove();
     document.removeEventListener("toggle", this.toggle, true);
     window.clearTimeout(this.scanTimer);
     window.clearTimeout(this.progressTimer);
@@ -180,6 +192,19 @@ class PageSession {
     if (!this.active) return;
     let changed = false;
     for (const record of records) {
+      if (record.type === "childList") {
+        for (const removed of record.removedNodes) {
+          const block = this.viewOwners.get(removed);
+          if (
+            block?.view?.host === removed &&
+            !removed.isConnected &&
+            block.element.isConnected
+          ) {
+            this.scheduleScan(block.element, false);
+            changed = true;
+          }
+        }
+      }
       if (this.isOwned(record.target)) continue;
       if (
         record.type === "childList" &&
@@ -549,7 +574,10 @@ class PageSession {
     if (!this.active || block.dirty || !block.element.isConnected) return;
     const parts = block.tasks.map((task) => ({
       id: task.segment.id,
-      text: task.text,
+      text:
+        task.text === restoreCode(task.segment.text, block.source.codes)
+          ? undefined
+          : task.text,
       error: task.error,
       pending:
         task.manual && (task.state === "queued" || task.state === "pending"),
@@ -563,10 +591,17 @@ class PageSession {
       block.view = undefined;
       return;
     }
-    if (!block.view?.host.isConnected)
-      block.view = createTranslationView(block.element, this.language, (node) =>
-        this.owned.add(node),
+    if (!block.view?.host.isConnected) {
+      block.view?.remove();
+      block.view = createTranslationView(
+        block.element,
+        this.language,
+        (node) => {
+          this.owned.add(node);
+          this.viewOwners.set(node, block);
+        },
       );
+    }
     block.view.update(parts, (id) => {
       const task = block.tasks.find((candidate) => candidate.segment.id === id);
       if (
@@ -640,6 +675,7 @@ class PageSession {
       const fingerprint = JSON.stringify(progress);
       if (fingerprint === this.lastProgress) return;
       this.lastProgress = fingerprint;
+      this.progressView.update(progress);
       void sendMessage<void>({ type: "page:progress", progress });
     };
     if (immediate) publish();
