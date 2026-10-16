@@ -24,6 +24,7 @@ import {
 import { contextExcerpt, relatedElements } from "./context";
 import { observeNavigation, type NavigationWatch } from "./navigation";
 import { createTranslationView, type TranslationView } from "./renderer";
+import { preserveReadingPosition } from "./reading-position";
 import { consumeSourceMutation, observeSourceChanges } from "./source-visibility";
 
 interface Task {
@@ -165,7 +166,9 @@ class PageSession {
         ok: false,
         error: { code: "cancelled", message: "翻译已停止。", retryable: false },
       });
-    for (const block of this.blocks.values()) block.view?.remove();
+    this.preserveReadingPosition(() => {
+      for (const block of this.blocks.values()) block.view?.remove();
+    });
     this.blocks.clear();
     this.queue.clear();
     this.dirty.clear();
@@ -186,6 +189,22 @@ class PageSession {
   }
 
   private readonly isOwned = (node: Node): boolean => this.owned.has(node);
+
+  private preserveReadingPosition(
+    change: () => void,
+    candidates: Iterable<Element> = [],
+  ): void {
+    const blocks = this.blocks;
+    preserveReadingPosition(
+      (function* () {
+        yield* blocks.keys();
+        yield* candidates;
+      })(),
+      this.isOwned,
+      change,
+    );
+  }
+
   private readonly toggle = (event: Event): void => {
     if (event.target instanceof Element && !this.isOwned(event.target))
       this.scheduleScan(event.target, true);
@@ -194,6 +213,7 @@ class PageSession {
   private mutations(records: MutationRecord[]): void {
     if (!this.active) return;
     let changed = false;
+    const removedBlocks = new Set<Block>();
     for (const record of records) {
       if (consumeSourceMutation(record)) continue;
       if (record.type === "childList") {
@@ -236,10 +256,10 @@ class PageSession {
             if (!(removed instanceof Element) || this.isOwned(removed))
               continue;
             const block = this.blocks.get(removed);
-            if (block && !removed.isConnected) this.release(block);
+            if (block && !removed.isConnected) removedBlocks.add(block);
             for (const child of removed.querySelectorAll(BLOCK_SELECTOR)) {
               const nested = this.blocks.get(child);
-              if (nested && !child.isConnected) this.release(nested);
+              if (nested && !child.isConnected) removedBlocks.add(nested);
             }
             for (const root of this.dirty.keys())
               if (!root.isConnected) this.dirty.delete(root);
@@ -247,6 +267,10 @@ class PageSession {
         }
       }
     }
+    if (removedBlocks.size)
+      this.preserveReadingPosition(() => {
+        for (const block of removedBlocks) this.release(block);
+      });
     if (changed) {
       this.navigation.checkArticle();
       this.publish();
@@ -300,15 +324,20 @@ class PageSession {
         for (const candidate of root.querySelectorAll(BLOCK_SELECTOR))
           candidates.add(candidate);
     }
-    for (const element of candidates) {
-      let deferred = false;
-      for (const [root, entry] of this.dirty)
-        if (root === element || (entry.subtree && root.contains(element))) {
-          deferred = true;
-          break;
+    this.preserveReadingPosition(
+      () => {
+        for (const element of candidates) {
+          let deferred = false;
+          for (const [root, entry] of this.dirty)
+            if (root === element || (entry.subtree && root.contains(element))) {
+              deferred = true;
+              break;
+            }
+          if (!deferred) this.refresh(element);
         }
-      if (!deferred) this.refresh(element);
-    }
+      },
+      candidates,
+    );
     this.armScan();
     this.schedulePump();
     this.publish();
@@ -583,6 +612,12 @@ class PageSession {
       this.stop("翻译会话已失效，请使用翻译快捷键重新开始。");
       return;
     }
+    this.preserveReadingPosition(() => this.applyTranslation(tasks, reply));
+    this.schedulePump();
+    this.publish();
+  }
+
+  private applyTranslation(tasks: Task[], reply: Reply<BatchResult>): void {
     const translations = new Map<string, Translation>();
     let invalid = false;
     if (reply.ok) {
@@ -650,8 +685,6 @@ class PageSession {
       }
     } else if (manualSucceeded) this.blocked = undefined;
     for (const block of changed) this.render(block);
-    this.schedulePump();
-    this.publish();
   }
 
   private render(block: Block): void {
@@ -693,32 +726,34 @@ class PageSession {
         () => block.source.nodes,
       );
     }
-    block.view.update(parts, (id) => {
-      const task = block.tasks.find((candidate) => candidate.segment.id === id);
-      if (
-        !task ||
-        !this.current(task) ||
-        task.state !== "failed" ||
-        block.dirty
-      )
-        return;
-      if (
-        extractSource(block.element, this.isOwned)?.signature !==
-        block.source.signature
-      ) {
-        block.view?.remove();
-        block.view = undefined;
-        this.scheduleScan(block.element, false);
-        return;
-      }
-      task.state = "queued";
-      task.error = undefined;
-      task.manual = true;
-      this.queue.add(task);
-      this.render(block);
-      this.schedulePump();
-      this.publish();
-    });
+    block.view.update(parts, (id) =>
+      this.preserveReadingPosition(() => {
+        const task = block.tasks.find((candidate) => candidate.segment.id === id);
+        if (
+          !task ||
+          !this.current(task) ||
+          task.state !== "failed" ||
+          block.dirty
+        )
+          return;
+        if (
+          extractSource(block.element, this.isOwned)?.signature !==
+          block.source.signature
+        ) {
+          block.view?.remove();
+          block.view = undefined;
+          this.scheduleScan(block.element, false);
+          return;
+        }
+        task.state = "queued";
+        task.error = undefined;
+        task.manual = true;
+        this.queue.add(task);
+        this.render(block);
+        this.schedulePump();
+        this.publish();
+      }),
+    );
   }
 
   private progress(): PageProgress {

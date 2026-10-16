@@ -14,13 +14,17 @@ export async function instrumentExtension(profile: string): Promise<string> {
   await writeFile(
     path.join(extension, "test-capture.js"),
     `(() => {
+      let markReady;
       const harness = globalThis.__justTranslateBrowserTest = {
-        commandListeners: [], pageReads: 0
+        commandListeners: [], pageReads: 0,
+        ready: new Promise(resolve => markReady = resolve)
       };
       const addListener = chrome.commands.onCommand.addListener.bind(chrome.commands.onCommand);
       chrome.commands.onCommand.addListener = (listener) => {
         harness.commandListeners.push(listener);
-        return addListener(listener);
+        const result = addListener(listener);
+        markReady();
+        return result;
       };
       const executeScript = chrome.scripting.executeScript.bind(chrome.scripting);
       chrome.scripting.executeScript = (...args) => {

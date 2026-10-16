@@ -99,8 +99,12 @@ for (const mode of ["bilingual", "translation"] as const) {
     assert.ok(browser);
     const cdp = await browser.newBrowserCDPSession();
     const focusSettings = async () => {
+      // A serviceworker target can appear before Chrome can deliver toolbar events.
+      await worker.evaluate("globalThis.__justTranslateBrowserTest.ready");
+      const existing = context!.pages().find((candidate) => candidate.url() === optionsUrl);
+      const opened = existing ? Promise.resolve(existing) : context!.waitForEvent("page");
       await clickToolbar(cdp, id, page);
-      options = context!.pages().find((candidate) => candidate.url() === optionsUrl) ?? await context!.waitForEvent("page");
+      options = await opened;
       await options.waitForURL(optionsUrl);
       await options.waitForFunction(async () => {
         const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
