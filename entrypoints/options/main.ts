@@ -8,6 +8,7 @@ import {
   normalizeBaseUrl,
   sendMessage,
   type Settings,
+  type SettingsSaveResult,
   type SettingsView,
   type UsageView,
 } from "../../src/shared";
@@ -32,13 +33,6 @@ const displayOptions = [
   element<HTMLInputElement>("display-bilingual"),
   element<HTMLInputElement>("display-translation"),
 ] as const;
-const actions = element<HTMLDivElement>("settings-actions");
-new ResizeObserver(() => {
-  document.documentElement.style.setProperty(
-    "--action-height",
-    `${actions.offsetHeight}px`,
-  );
-}).observe(actions);
 let loadedSettings: Settings = { ...DEFAULT_SETTINGS };
 let keyOrigin = "";
 let busy = false;
@@ -180,7 +174,7 @@ async function submitConfiguration(testConnection: boolean): Promise<void> {
       translation = reply.value.translation;
       activeButton.textContent = "正在保存…";
     }
-    const reply = await sendMessage<SettingsView>({
+    const reply = await sendMessage<SettingsSaveResult>({
       type: "settings:save",
       settings,
       apiKey,
@@ -199,8 +193,13 @@ async function submitConfiguration(testConnection: boolean): Promise<void> {
       return;
     }
     populate(persisted.value);
-    if (testConnection) setConnectionState("连接正常", "ready");
-    feedback(translation ?? "已保存", "success");
+    if (reply.value.warning) {
+      setConnectionState("已保存，需重载", "error");
+      feedback(reply.value.warning, "error");
+    } else {
+      if (testConnection) setConnectionState("连接正常", "ready");
+      feedback(translation ?? "已保存", "success");
+    }
   } catch {
     feedback("操作失败，请检查扩展权限。", "error");
   } finally {
@@ -261,7 +260,10 @@ testButton.addEventListener("click", () => void submitConfiguration(true));
 form.addEventListener("input", () => {
   baseUrlInput.setCustomValidity("");
   keyInput.setCustomValidity("");
-  if (initialized && !busy) feedback("未保存");
+  if (initialized && !busy) {
+    setConnectionState("未保存");
+    feedback("");
+  }
 });
 form
   .querySelectorAll<HTMLInputElement>('input[name="provider"]')
@@ -280,8 +282,8 @@ form
       element<HTMLInputElement>("output-price").value = deepseek
         ? String(DEFAULT_SETTINGS.outputPricePerMillion)
         : "0";
-      setConnectionState("尚未测试");
-      feedback("未保存");
+      setConnectionState("未保存");
+      feedback("");
     });
   });
 baseUrlInput.addEventListener("change", () => {

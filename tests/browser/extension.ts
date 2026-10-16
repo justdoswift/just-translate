@@ -61,7 +61,7 @@ export async function dispatchTranslationCommand(
     if (listeners.length !== 1) throw new Error("Expected one production command listener");
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab?.id === undefined) throw new Error("No active command target");
-    listeners[0]("toggle-translation", tab);
+    await listeners[0]("toggle-translation", tab);
   })()`);
 }
 

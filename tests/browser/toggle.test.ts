@@ -14,6 +14,7 @@ for (const mode of ["bilingual", "translation"] as const) {
     const events = new EventEmitter();
     const requests: string[][] = [];
     const pending: { release: () => void; finished: Promise<void> }[] = [];
+    let stage = "launch";
     let hold = false;
     const originals = [
       "A translation session must belong to one page.",
@@ -63,6 +64,7 @@ for (const mode of ["bilingual", "translation"] as const) {
     const base = `http://127.0.0.1:${address.port}`;
     let context: BrowserContext | undefined;
     t.after(async () => {
+      t.diagnostic(`Last stage: ${stage}`);
       for (const gate of pending) gate.release();
       await context?.close();
       server.closeAllConnections();
@@ -129,6 +131,7 @@ for (const mode of ["bilingual", "translation"] as const) {
     const initialHeight = await page.locator("#upgrade").evaluate((button) => button.getBoundingClientRect().height);
     const initialBelow = await page.locator("#below").evaluate((node) => node.getBoundingClientRect().top);
     await page.evaluate("window.upgradeClicks = 0; document.getElementById('upgrade').addEventListener('click', () => window.upgradeClicks++)");
+    stage = "interrupted startup off";
 
     // Delay script injection, request off, then release the old start. The final
     // command promise is a completion barrier, not a timer-based race assertion.
@@ -152,7 +155,10 @@ for (const mode of ["bilingual", "translation"] as const) {
         };
         try {
           const first = command("toggle-translation", tab);
-          await waiting;
+          await Promise.race([
+            waiting,
+            first.then(() => { throw new Error("Startup ended before the injection gate"); }),
+          ]);
           const off = command("toggle-translation", tab);
           const latest = ${restart} ? command("toggle-translation", tab) : Promise.resolve();
           release();
@@ -167,6 +173,7 @@ for (const mode of ["bilingual", "translation"] as const) {
     assert.equal(await interruptedStart(false), 0, "cancelled startup must never reach page:start");
     await restored();
     assert.equal(requests.length, 0, "off during startup must not send a model request");
+    stage = "interrupted startup on";
     assert.equal(await interruptedStart(true), 1, "only the latest on intent may start a session");
     await complete();
     assert.deepEqual(await page.locator("article p, #upgrade").evaluateAll((blocks) =>
@@ -186,12 +193,14 @@ for (const mode of ["bilingual", "translation"] as const) {
     await command();
     await restored();
     assert.equal(requests.length, completedRequests, "turning off must not start another translation");
+    stage = "hold model response";
 
     await options.evaluate(() => chrome.runtime.sendMessage({ type: "cache:clear" }));
     hold = true;
     const requested = once(events, "requested");
     await command();
     await requested;
+    stage = "cancel model response";
     assert.equal(await page.locator("#upgrade").evaluate((button) => button.getBoundingClientRect().height), initialHeight,
       "inline loading must retain the control height");
     await command();
@@ -202,15 +211,18 @@ for (const mode of ["bilingual", "translation"] as const) {
     await page.clock.install();
     await page.clock.runFor(1000);
     await restored();
+    stage = "restart after cancelled response";
 
     await command();
     await complete();
+    stage = "reload extension";
     // Reload the extension without refreshing the page. The next injection must
     // dispose the old context's views and virtual source before creating another.
     const nextWorker = context.waitForEvent("serviceworker");
     await manager.evaluate(`new Promise((resolve, reject) => chrome.developerPrivate.reload(${JSON.stringify(id)}, {failQuietly:true}, error => chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(error)))`);
     worker = await nextWorker;
     await focusSettings();
+    stage = "translate after reload";
     await command();
     await complete();
     assert.deepEqual(await page.locator("article p, #upgrade").evaluateAll((blocks) =>
@@ -219,6 +231,7 @@ for (const mode of ["bilingual", "translation"] as const) {
     await command();
     await restored();
     assert.equal(await page.locator("#upgrade").evaluate((button) => button.getBoundingClientRect().height), initialHeight);
+    stage = "complete";
     await cdp.detach();
   });
 }

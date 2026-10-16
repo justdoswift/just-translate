@@ -32,14 +32,6 @@ function articleIdentity(element: Element | null): string {
   return values.some(Boolean) ? JSON.stringify(values) : "";
 }
 
-function findArticleRoot(): Element | null {
-  const main = document.querySelector('main,[role="main"]');
-  const articles = (main ?? document).querySelectorAll(
-    'article,[role="article"]',
-  );
-  // A feed's many article cards are not independent page navigations.
-  return articles.length === 1 ? articles.item(0) : main;
-}
 
 function canonicalIdentity(): string | undefined {
   const href = document.querySelector<HTMLLinkElement>(
@@ -62,6 +54,25 @@ export interface NavigationWatch {
 export function observeNavigation(
   end: (reason: string) => void,
 ): NavigationWatch {
+  // Once this document is a feed, removing cards must not promote the last
+  // remaining card's identity into a page-navigation identity.
+  let feed = false;
+  const findArticleRoot = (): Element | null => {
+    const main = document.querySelector('main,[role="main"]');
+    if (feed) return main;
+    const selector = 'article,[role="article"]';
+    let sole: Element | null = null;
+    for (const article of (main ?? document).querySelectorAll(selector)) {
+      const parentArticle = article.parentElement?.closest(selector);
+      if (parentArticle && (!main || main.contains(parentArticle))) continue;
+      if (sole) {
+        feed = true;
+        return main;
+      }
+      sole = article;
+    }
+    return sole ?? main;
+  };
   const locationIdentity = pageIdentity(location.href);
   let articleKey = articleIdentity(findArticleRoot());
   let canonical = canonicalIdentity();
@@ -87,7 +98,9 @@ export function observeNavigation(
     checkArticle() {
       checkLocation();
       if (ended) return;
+      const wasFeed = feed;
       const nextKey = articleIdentity(findArticleRoot());
+      if (feed !== wasFeed) articleKey = "";
       const nextCanonical = canonicalIdentity();
       // Hydration can replace the whole root without changing the article.
       // Require a changed, explicit identity rather than DOM object identity.

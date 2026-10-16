@@ -119,6 +119,7 @@ export async function requireApiPermission(settings: Settings): Promise<void> {
 export class SettingsStore {
   private current: Settings = { ...DEFAULT_SETTINGS };
   private key = "";
+  private sessionKeyId = "legacy";
   fingerprint = "";
 
   async initialize(): Promise<void> {
@@ -142,7 +143,21 @@ export class SettingsStore {
         this.current = { ...DEFAULT_SETTINGS };
       }
     }
-    const stored = this.current.rememberKey ? local[API_KEY] : session[API_KEY];
+    const savedSettings: unknown = local[SETTINGS_KEY];
+    this.sessionKeyId =
+      savedSettings && typeof savedSettings === "object" &&
+      "sessionKeyId" in savedSettings && typeof savedSettings.sessionKeyId === "string"
+        ? savedSettings.sessionKeyId
+        : "legacy";
+    const sessionKeys: unknown = session[API_KEY];
+    const sessionKey =
+      typeof sessionKeys === "string" && this.sessionKeyId === "legacy"
+        ? sessionKeys
+        : sessionKeys && typeof sessionKeys === "object" &&
+            Object.hasOwn(sessionKeys, this.sessionKeyId)
+          ? Reflect.get(sessionKeys, this.sessionKeyId)
+          : undefined;
+    const stored = this.current.rememberKey ? local[API_KEY] : sessionKey;
     try {
       this.key = validateKey(stored ?? "", false);
     } catch {
@@ -163,20 +178,39 @@ export class SettingsStore {
 
   async save(settings: Settings, apiKey: string): Promise<SettingsView> {
     const next = validateSettings(settings);
-    const key = validateKey(apiKey, false);
+    const key = validateKey(apiKey);
     await requireApiPermission(next);
     const fingerprint = await accountFingerprint(key);
-    if (next.rememberKey) {
-      await chrome.storage.local.set({ [SETTINGS_KEY]: next, [API_KEY]: key });
-      await chrome.storage.session.remove(API_KEY);
-    } else {
-      await chrome.storage.session.set({ [API_KEY]: key });
-      await chrome.storage.local.set({ [SETTINGS_KEY]: next });
-      await chrome.storage.local.remove(API_KEY);
+    const sessionKeyId = crypto.randomUUID();
+    if (!next.rememberKey) {
+      // Stage the new credential without replacing the committed one. If the
+      // local commit fails or the worker stops, the old settings still resolve
+      // only their own key, including when upgrading a legacy string key.
+      await chrome.storage.session.set({
+        [API_KEY]: {
+          ...(!this.current.rememberKey ? { [this.sessionKeyId]: this.key } : {}),
+          [sessionKeyId]: key,
+        },
+      });
     }
+    // Settings and the remembered credential share one commit. A session-only
+    // save clears any remembered secret in that same atomic storage operation.
+    await chrome.storage.local.set({
+      [SETTINGS_KEY]: { ...next, sessionKeyId },
+      [API_KEY]: next.rememberKey ? key : "",
+    });
     this.current = next;
     this.key = key;
     this.fingerprint = fingerprint;
+    this.sessionKeyId = sessionKeyId;
+    // Cleanup is not the commit: failure here must not report an unsuccessful
+    // save while leaving a different configuration active after worker restart.
+    try {
+      if (next.rememberKey) await chrome.storage.session.remove(API_KEY);
+      else await chrome.storage.session.set({ [API_KEY]: { [sessionKeyId]: key } });
+    } catch {
+      // A later save replaces staged keys; initialization uses only the commit.
+    }
     return this.view();
   }
 }
