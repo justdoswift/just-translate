@@ -79,7 +79,7 @@ const ATTRIBUTE_FILTER = [
 ];
 
 class PageSession {
-  private active = true;
+  private running = true;
   private readonly blocks = new Map<Element, Block>();
   private readonly queue = new Set<Task>();
   private readonly owned = new WeakSet<Node>();
@@ -107,6 +107,7 @@ class PageSession {
     private readonly language: string,
     private readonly displayMode: Settings["displayMode"],
     private readonly ended: (session: PageSession) => void,
+    private readonly isContextValid: () => boolean,
   ) {
     this.observer = new MutationObserver((records) => this.mutations(records));
     this.intersection = new IntersectionObserver(
@@ -135,6 +136,10 @@ class PageSession {
     this.publish(true);
   }
 
+  private get active(): boolean {
+    return this.running && this.isContextValid();
+  }
+
   snapshot(): PageSnapshot {
     return {
       active: this.active,
@@ -143,11 +148,11 @@ class PageSession {
     };
   }
 
-  stop(reason: string): void {
-    if (!this.active) return;
+  stop(reason: string, notify = true): void {
+    if (!this.running) return;
     for (const record of this.observer.takeRecords()) consumeSourceMutation(record);
     observeSourceChanges(false);
-    this.active = false;
+    this.running = false;
     this.observer.disconnect();
     this.intersection.disconnect();
     this.navigation.disconnect();
@@ -164,17 +169,19 @@ class PageSession {
     this.blocks.clear();
     this.queue.clear();
     this.dirty.clear();
-    void sendMessage<void>({
-      type: "page:progress",
-      progress: {
-        sessionId: this.id,
-        phase: "off",
-        translated: 0,
-        pending: 0,
-        failed: 0,
-      },
-    });
-    void sendMessage<void>({ type: "page:end", sessionId: this.id, reason });
+    if (notify && this.isContextValid()) {
+      void sendMessage<void>({
+        type: "page:progress",
+        progress: {
+          sessionId: this.id,
+          phase: "off",
+          translated: 0,
+          pending: 0,
+          failed: 0,
+        },
+      });
+      void sendMessage<void>({ type: "page:end", sessionId: this.id, reason });
+    }
     this.ended(this);
   }
 
@@ -573,7 +580,7 @@ class PageSession {
       !reply.ok &&
       (reply.error.code === "stale" || reply.error.code === "cancelled")
     ) {
-      this.stop("翻译会话已失效，请点击工具栏重新开始。");
+      this.stop("翻译会话已失效，请使用翻译快捷键重新开始。");
       return;
     }
     const translations = new Map<string, Translation>();
@@ -788,10 +795,19 @@ function isPageMessage(value: unknown): value is PageMessage {
   );
 }
 
-export function installContentController(): void {
+export function installContentController(
+  isContextValid: () => boolean,
+): () => void {
+  let disposed = false;
   let session: PageSession | undefined;
-  chrome.runtime.onMessage.addListener((message: unknown, sender, respond) => {
+  const isValid = (): boolean => !disposed && isContextValid();
+  const listener: Parameters<typeof chrome.runtime.onMessage.addListener>[0] = (
+    message: unknown,
+    sender,
+    respond,
+  ) => {
     if (
+      !isValid() ||
       sender.id !== chrome.runtime.id ||
       sender.tab ||
       !isPageMessage(message)
@@ -806,6 +822,7 @@ export function installContentController(): void {
         (ended) => {
           if (session === ended) session = undefined;
         },
+        isValid,
       );
     } else if (
       message.type === "page:stop" &&
@@ -813,11 +830,30 @@ export function installContentController(): void {
     ) {
       session?.stop(message.reason ?? "用户停止翻译。");
     }
+    if (!isValid()) {
+      // A context can be revoked while the new session is being constructed.
+      session?.stop("页面翻译控制器已卸载。", false);
+      session = undefined;
+      return false;
+    }
     const reply: Reply<PageSnapshot> = {
       ok: true,
       value: session?.snapshot() ?? { active: false },
     };
     respond(reply);
     return false;
-  });
+  };
+  chrome.runtime.onMessage.addListener(listener);
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    session?.stop("页面翻译控制器已卸载。", false);
+    session = undefined;
+    try {
+      chrome.runtime.onMessage.removeListener(listener);
+    } catch (error) {
+      // Chrome may have already revoked this listener's extension context.
+      if (chrome.runtime.id) throw error;
+    }
+  };
 }

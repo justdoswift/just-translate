@@ -33,6 +33,11 @@ interface StoredSession {
   configurationId: string;
   requests: string[];
 }
+interface ToggleIntent {
+  enabled?: boolean;
+  toggles: number;
+  generation: number;
+}
 const SESSIONS_KEY = "justTranslate.sessions";
 
 export default defineBackground(() => {
@@ -43,13 +48,16 @@ export default defineBackground(() => {
   const documents = new Map<number, string>();
   const generations = new Map<number, number>();
   const actions = new Map<number, Promise<void>>();
+  const intents = new Map<number, ToggleIntent>();
   const configurationIds = new Map<string, string>();
   let metadataWrites: Promise<unknown> = Promise.resolve();
   let configuration: Promise<unknown> = Promise.resolve();
   let configurationEpoch = 0;
+  let restored = false;
   const ready = settings.initialize().then(async () => {
     await state.initialize(settings.view().settings);
     await restoreSessions();
+    restored = true;
   });
   // Listener registration stays synchronous; a failed initialization is surfaced by each operation.
   void ready.catch(() => undefined);
@@ -211,7 +219,9 @@ export default defineBackground(() => {
     tabId: number,
     reason: string,
     notify = true,
+    intent?: ToggleIntent,
   ): Promise<void> {
+    if (intents.get(tabId) !== intent) intents.delete(tabId);
     const session = sessions.get(tabId);
     // Invalidate identity before aborting fetches or posting page:stop.
     sessions.delete(tabId);
@@ -281,16 +291,19 @@ export default defineBackground(() => {
     }
   }
 
-  async function startOrStop(tabId: number): Promise<void> {
-    await ready;
-    await configuration;
-    if (sessions.has(tabId)) {
-      await stop(tabId, "已停止翻译，原文保持不变。");
-      return;
-    }
-    const generation = generations.get(tabId) ?? 0;
+  function currentIntent(tabId: number, intent: ToggleIntent): boolean {
+    return (
+      intents.get(tabId) === intent &&
+      intent.generation === (generations.get(tabId) ?? 0)
+    );
+  }
+
+  async function start(tabId: number, intent: ToggleIntent): Promise<void> {
     const epoch = configurationEpoch;
+    const current = () =>
+      currentIntent(tabId, intent) && epoch === configurationEpoch;
     const tab = await chrome.tabs.get(tabId);
+    if (!current()) return;
     if (!tab.url || !/^https?:\/\//i.test(tab.url))
       throw new RequestError(
         "unsupported",
@@ -306,6 +319,7 @@ export default defineBackground(() => {
     } catch {
       /* Script is injected only after the named translation command. */
     }
+    if (!current()) return;
     if (snapshot?.ok && snapshot.value.active) {
       await chrome.tabs.sendMessage(
         tabId,
@@ -315,12 +329,14 @@ export default defineBackground(() => {
         } satisfies PageMessage,
         { frameId: 0 },
       );
+      if (!current()) return;
       await badge(tabId, "off");
       return;
     }
     const view = settings.view();
     validateKey(view.apiKey);
     await requireApiPermission(view.settings);
+    if (!current()) return;
     const injection = snapshot?.ok
       ? await chrome.scripting.executeScript({
           target: { tabId, frameIds: [0] },
@@ -333,20 +349,13 @@ export default defineBackground(() => {
     const documentId = injection.find(
       (result) => result.frameId === 0,
     )?.documentId;
-    if (
-      !documentId ||
-      generation !== (generations.get(tabId) ?? 0) ||
-      epoch !== configurationEpoch
-    )
+    if (!current()) return;
+    if (!documentId)
       throw new RequestError("stale", "页面或设置已变化，请再次使用翻译快捷键。");
     const configurationId = await accountFingerprint(
       JSON.stringify(view.settings),
     );
-    if (
-      generation !== (generations.get(tabId) ?? 0) ||
-      epoch !== configurationEpoch
-    )
-      throw new RequestError("stale", "页面或设置已变化，请再次使用翻译快捷键。");
+    if (!current()) return;
     const session: TranslationSession = {
       id: crypto.randomUUID(),
       tabId,
@@ -363,7 +372,7 @@ export default defineBackground(() => {
     configurationIds.set(session.id, configurationId);
     try {
       await persistSessions();
-      if (sessions.get(tabId) !== session) return;
+      if (!current() || sessions.get(tabId) !== session) return;
       const reply = (await chrome.tabs.sendMessage(
         tabId,
         {
@@ -374,19 +383,20 @@ export default defineBackground(() => {
         } satisfies PageMessage,
         { documentId },
       )) as Reply<PageSnapshot>;
+      if (!current() || sessions.get(tabId) !== session) return;
       if (!reply?.ok)
         throw new RequestError(
           "internal",
           "页面翻译脚本未能启动；请刷新页面后重试。",
           true,
         );
-      if (sessions.get(tabId) !== session) return;
       await badge(tabId, "running");
+      if (!current() || sessions.get(tabId) !== session) return;
       await chrome.storage.session.remove(STARTUP_ERROR_KEY);
     } catch (error) {
-      if (sessions.get(tabId) === session)
-        await stop(tabId, "页面脚本未能启动。");
-      throw error;
+      if (!current() || sessions.get(tabId) !== session) return;
+      await stop(tabId, "页面脚本未能启动。", true, intent);
+      if (current()) throw error;
     }
   }
 
@@ -458,6 +468,7 @@ export default defineBackground(() => {
       const operation = configuration.then(async () => {
         await requireApiPermission(next);
         configurationEpoch++;
+        intents.clear();
         engine.cancelTests();
         await Promise.all(
           [...sessions.keys()].map((tabId) =>
@@ -508,7 +519,9 @@ export default defineBackground(() => {
   async function reportStartupError(
     error: unknown,
     tabId?: number,
+    current: () => boolean = () => true,
   ): Promise<void> {
+    if (!current()) return;
     const detail = errorDetail(error);
     if (detail.code === "internal" && error instanceof Error) {
       // Startup errors come from Chrome APIs, not model responses. Keep
@@ -516,11 +529,13 @@ export default defineBackground(() => {
       detail.message = `无法启动翻译：${error.message.replace(/(?:https?|chrome-extension):\/\/\S+/g, "[页面地址]").slice(0, 250)}`;
     }
     if (tabId !== undefined) await badge(tabId, "blocked", detail.message);
+    if (!current()) return;
     try {
       await chrome.storage.session.set({ [STARTUP_ERROR_KEY]: detail });
     } catch {
       // The toolbar title remains available if session storage fails.
     }
+    if (!current()) return;
     try {
       await chrome.runtime.openOptionsPage();
     } catch {
@@ -528,26 +543,72 @@ export default defineBackground(() => {
     }
   }
 
-  function toggleTranslation(tab?: chrome.tabs.Tab): void {
+  function toggleTranslation(tab?: chrome.tabs.Tab): Promise<void> {
     if (!tab) {
-      void chrome.tabs
+      return chrome.tabs
         .query({ active: true, currentWindow: true })
         .then(([activeTab]) => {
-          if (activeTab) toggleTranslation(activeTab);
+          if (activeTab) return toggleTranslation(activeTab);
         })
         .catch((error: unknown) => reportStartupError(error));
-      return;
     }
-    if (tab.id === undefined) return;
+    if (tab.id === undefined) return Promise.resolve();
     const tabId = tab.id;
+    const previousIntent = intents.get(tabId);
+    // Before restoration completes, preserve keypress parity instead of guessing
+    // whether the persisted page is on. Afterwards sessions own settled state.
+    const enabled = previousIntent
+      ? (previousIntent.enabled ??
+        (sessions.has(tabId) !== (previousIntent.toggles % 2 === 1)))
+      : sessions.has(tabId);
+    const intent: ToggleIntent = {
+      enabled: restored ? !enabled : undefined,
+      toggles: (previousIntent?.toggles ?? 0) + 1,
+      generation: generations.get(tabId) ?? 0,
+    };
+    intents.set(tabId, intent);
+    // Off invalidates identity immediately, not after a pending page:start reply.
+    const stopping = intent.enabled === false
+      ? stop(tabId, "已停止翻译，原文保持不变。", true, intent)
+      : undefined;
+    // Attach rejection handling now even while an earlier start is still pending.
+    const stopped = stopping?.then(
+      () => undefined,
+      (error: unknown) => ({ error }),
+    );
     const previous = actions.get(tabId) ?? Promise.resolve();
     const action = previous
-      .then(() => startOrStop(tabId))
-      .catch((error: unknown) => reportStartupError(error, tabId));
+      .then(async () => {
+        // Even superseded off commands remain a barrier before the next start.
+        const failure = await stopped;
+        if (failure && currentIntent(tabId, intent)) throw failure.error;
+        await ready;
+        if (!currentIntent(tabId, intent)) return;
+        await configuration;
+        if (!currentIntent(tabId, intent)) return;
+        intent.enabled ??=
+          sessions.has(tabId) !== (intent.toggles % 2 === 1);
+        if (!stopped && !intent.enabled) {
+          await stop(tabId, "已停止翻译，原文保持不变。", true, intent);
+        }
+        if (!currentIntent(tabId, intent)) return;
+        if (intent.enabled) await start(tabId, intent);
+      })
+      .catch((error: unknown) => {
+        if (!currentIntent(tabId, intent)) return;
+        intent.enabled = false;
+        return reportStartupError(
+          error,
+          tabId,
+          () => currentIntent(tabId, intent),
+        );
+      });
     actions.set(tabId, action);
     void action.finally(() => {
       if (actions.get(tabId) === action) actions.delete(tabId);
+      if (intents.get(tabId) === intent) intents.delete(tabId);
     });
+    return action;
   }
 
   chrome.action.onClicked.addListener(() => {
@@ -556,10 +617,20 @@ export default defineBackground(() => {
     });
   });
   chrome.commands.onCommand.addListener((command, tab) => {
-    if (command === "toggle-translation") toggleTranslation(tab);
+    if (command === "toggle-translation") return toggleTranslation(tab);
   });
 
   chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    // A start that has not acquired a document must not migrate to a new page.
+    // Settled sessions still use the document-bound ping below for anchor loads.
+    if (
+      changeInfo.status === "loading" &&
+      intents.has(tabId) &&
+      !sessions.has(tabId)
+    ) {
+      generations.set(tabId, (generations.get(tabId) ?? 0) + 1);
+      intents.delete(tabId);
+    }
     // Chrome can report "loading" for a same-document anchor. Only a failed
     // document-bound ping proves this session no longer owns the current page.
     // Content pagehide handles immediate cancellation on real navigation.

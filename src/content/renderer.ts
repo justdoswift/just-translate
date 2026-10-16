@@ -1,5 +1,5 @@
 import { sendMessage, type AppError, type DisplayMode } from "../shared";
-import { createSourceVisibility } from "./source-visibility";
+import { createSourceVisibility, readSourceText } from "./source-visibility";
 
 export interface RenderedPart {
   id: string;
@@ -23,52 +23,17 @@ const SETTINGS_ERRORS: Partial<Record<AppError["code"], true>> = {
   quota: true,
 };
 
-const expandedButtons = new WeakMap<
-  HTMLButtonElement,
-  {
-    readers: number;
-    restore: () => void;
+function controlLabel(element: Element, nodes: readonly Node[]): Element {
+  let label: Element | undefined;
+  for (const node of nodes) {
+    if (!readSourceText(node).trim()) continue;
+    const parent = node instanceof Element ? node : node.parentElement;
+    if (!parent) continue;
+    if (!label) label = parent;
+    while (label !== element && !label.contains(parent))
+      label = label.parentElement ?? element;
   }
->();
-
-function expandButton(button: HTMLButtonElement): () => void {
-  let entry = expandedButtons.get(button);
-  if (!entry) {
-    const values = ([
-      ["height", "auto"],
-      ["max-height", "none"],
-      ["overflow", "visible"],
-      ["-webkit-line-clamp", "unset"],
-      ["line-clamp", "unset"],
-    ] as const).map(([property, expanded]) => {
-      const value = button.style.getPropertyValue(property);
-      const priority = button.style.getPropertyPriority(property);
-      button.style.setProperty(property, expanded, "important");
-      return { property, expanded, value, priority };
-    });
-    entry = {
-      readers: 0,
-      restore() {
-        for (const { property, expanded, value, priority } of values) {
-          if (
-            button.style.getPropertyValue(property) !== expanded ||
-            button.style.getPropertyPriority(property) !== "important"
-          )
-            continue;
-          if (value) button.style.setProperty(property, value, priority);
-          else button.style.removeProperty(property);
-        }
-      },
-    };
-    expandedButtons.set(button, entry);
-  }
-  entry.readers += 1;
-  return () => {
-    if (--entry.readers === 0) {
-      entry.restore();
-      expandedButtons.delete(button);
-    }
-  };
+  return label ?? element;
 }
 
 /** Preserve original nodes so stopping restores links, controls and site updates. */
@@ -79,16 +44,19 @@ export function createTranslationView(
   displayMode: DisplayMode,
   readSourceNodes: () => readonly Node[],
 ): TranslationView {
+  const inlineControl = !!element.closest("button") ||
+    (!element.matches("p,h1,h2,h3,h4,h5,h6,blockquote,li,article,main,section") &&
+      !!element.closest('a,[role="button"],[role="link"]'));
   const host = document.createElement("span");
   register(host);
   host.lang = language;
   host.setAttribute("translate", "no");
   host.setAttribute("aria-label", "Just Translate 译文");
-  host.style.setProperty("display", "block", "important");
+  host.style.setProperty("display", inlineControl ? "inline" : "block", "important");
   host.style.setProperty("font", "inherit", "important");
   host.style.setProperty("color", "inherit", "important");
-  host.style.setProperty("margin-block", "0.45em 0.15em", "important");
-  host.style.setProperty("white-space", "normal", "important");
+  host.style.setProperty("margin-block", inlineControl ? "0" : "0.45em 0.15em", "important");
+  host.style.setProperty("white-space", inlineControl ? "inherit" : "normal", "important");
   const shadow = host.attachShadow({ mode: "closed" });
   const style = document.createElement("style");
   style.textContent = `
@@ -110,21 +78,26 @@ export function createTranslationView(
     button:hover { text-decoration: underline; }
     button:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
     button:disabled { cursor: wait; opacity: .7; }
+    ${inlineControl ? `
+      .parts, .part { display: inline; white-space: inherit; overflow-wrap: normal; }
+      .part + .part { margin: 0; }
+      .loading { display: inline-flex; min-height: 0; vertical-align: middle; margin-inline-start: .25em; }
+      .error { display: inline; font: inherit; }
+      .actions { gap: .25em; margin-inline-start: .25em; vertical-align: baseline; }
+      button { min-height: 0; padding: 0 .25em; line-height: inherit; }
+    ` : ""}
   `;
   const content = document.createElement("span");
   content.className = "parts";
   shadow.append(style, content);
   const source = createSourceVisibility(readSourceNodes);
-  const button = element.closest("button");
-  const restoreButton =
-    button && displayMode === "translation" ? expandButton(button) : undefined;
   const restoredStyles: {
     property: string;
     value: string;
     priority: string;
   }[] = [];
   if (
-    (!button || displayMode === "translation") &&
+    !inlineControl &&
     element instanceof HTMLElement
   ) {
     const computed = getComputedStyle(element);
@@ -138,14 +111,14 @@ export function createTranslationView(
       element.style.setProperty(property, "unset", "important");
     }
   }
-  // Translation-only labels stay inside their original clickable control.
-  if (button && displayMode === "bilingual") button.after(host);
-  else element.append(host);
+  // Controls replace their label in its original layout slot, including bilingual mode.
+  // Paragraphs keep the independent translation row below their source.
+  (inlineControl ? controlLabel(element, readSourceNodes()) : element).append(host);
   return {
     host,
     update(parts, retry) {
       if (
-        displayMode === "translation" &&
+        (displayMode === "translation" || inlineControl) &&
         parts.length > 0 &&
         parts.every(
           (part) => part.text !== undefined && !part.pending && !part.error,
@@ -177,13 +150,15 @@ export function createTranslationView(
           row.classList.add("error");
           row.lang = "zh-CN";
           const label = document.createElement("span");
-          label.textContent = `此段翻译失败：${part.error.message}${part.error.uncertain ? " 请求结果未确认；重试可能重复计费。" : ""}`;
+          const errorMessage = `此段翻译失败：${part.error.message}${part.error.uncertain ? " 请求结果未确认；重试可能重复计费。" : ""}`;
+          label.textContent = inlineControl ? "翻译失败" : errorMessage;
+          if (inlineControl) row.title = errorMessage;
           const actions = document.createElement("span");
           actions.className = "actions";
           const retryButton = document.createElement("button");
           retryButton.type = "button";
-          retryButton.textContent = "重试此段";
-          retryButton.setAttribute("aria-label", "仅重试这一段失败的翻译");
+          retryButton.textContent = inlineControl ? "重试" : "重试此段";
+          retryButton.setAttribute("aria-label", inlineControl ? `${errorMessage} 重试翻译` : "仅重试这一段失败的翻译");
           retryButton.addEventListener("click", (event) => {
             event.preventDefault();
             event.stopPropagation();
@@ -196,7 +171,7 @@ export function createTranslationView(
           if (SETTINGS_ERRORS[part.error.code]) {
             const settings = document.createElement("button");
             settings.type = "button";
-            settings.textContent = "打开设置";
+            settings.textContent = inlineControl ? "设置" : "打开设置";
             settings.addEventListener("click", (event) => {
               event.preventDefault();
               event.stopPropagation();
@@ -233,7 +208,6 @@ export function createTranslationView(
     remove() {
       source.restore();
       host.remove();
-      restoreButton?.();
       if (element instanceof HTMLElement) {
         for (const { property, value, priority } of restoredStyles) {
           // Do not overwrite a later inline style change made by the website.

@@ -73,7 +73,7 @@ export function observeNavigation(
   };
   const checkLocation = (): void => {
     if (pageIdentity(location.href) !== locationIdentity)
-      finish("页面地址已变化，请点击工具栏重新翻译。");
+      finish("页面地址已变化，请用翻译快捷键重新翻译。");
   };
   const pagehide = (): void => finish("页面文档已离开。");
   // Chromium exposes Navigation even where an older TypeScript DOM library omits its declaration.
@@ -95,7 +95,7 @@ export function observeNavigation(
         (articleKey && nextKey && articleKey !== nextKey) ||
         (canonical && nextCanonical && canonical !== nextCanonical)
       ) {
-        finish("正文已切换，请点击工具栏重新翻译。");
+        finish("正文已切换，请用翻译快捷键重新翻译。");
         return;
       }
       if (nextKey) articleKey = nextKey;
