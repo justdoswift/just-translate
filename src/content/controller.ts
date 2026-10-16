@@ -9,6 +9,7 @@ import {
   type PageProgress,
   type Reply,
   type Segment,
+  type Settings,
   type Translation,
 } from "../shared";
 import {
@@ -20,8 +21,11 @@ import {
   splitSource,
   type ExtractedSource,
 } from "./extraction";
+import { contextExcerpt, relatedElements } from "./context";
 import { observeNavigation, type NavigationWatch } from "./navigation";
 import { createTranslationView, type TranslationView } from "./renderer";
+import { preserveReadingPosition } from "./reading-position";
+import { consumeSourceMutation, observeSourceChanges } from "./source-visibility";
 
 interface Task {
   segment: Segment;
@@ -76,10 +80,11 @@ const ATTRIBUTE_FILTER = [
 ];
 
 class PageSession {
-  private active = true;
+  private running = true;
   private readonly blocks = new Map<Element, Block>();
   private readonly queue = new Set<Task>();
   private readonly owned = new WeakSet<Node>();
+  private readonly viewOwners = new WeakMap<Node, Block>();
   private readonly dirty = new Map<
     Element,
     { due: number; subtree: boolean }
@@ -101,7 +106,9 @@ class PageSession {
   constructor(
     readonly id: string,
     private readonly language: string,
+    private readonly displayMode: Settings["displayMode"],
     private readonly ended: (session: PageSession) => void,
+    private readonly isContextValid: () => boolean,
   ) {
     this.observer = new MutationObserver((records) => this.mutations(records));
     this.intersection = new IntersectionObserver(
@@ -124,9 +131,14 @@ class PageSession {
       attributes: true,
       attributeFilter: ATTRIBUTE_FILTER,
     });
+    observeSourceChanges(true);
     document.addEventListener("toggle", this.toggle, true);
     this.scheduleScan(document.body ?? document.documentElement, true);
     this.publish(true);
+  }
+
+  private get active(): boolean {
+    return this.running && this.isContextValid();
   }
 
   snapshot(): PageSnapshot {
@@ -137,9 +149,11 @@ class PageSession {
     };
   }
 
-  stop(reason: string): void {
-    if (!this.active) return;
-    this.active = false;
+  stop(reason: string, notify = true): void {
+    if (!this.running) return;
+    for (const record of this.observer.takeRecords()) consumeSourceMutation(record);
+    observeSourceChanges(false);
+    this.running = false;
     this.observer.disconnect();
     this.intersection.disconnect();
     this.navigation.disconnect();
@@ -152,25 +166,45 @@ class PageSession {
         ok: false,
         error: { code: "cancelled", message: "翻译已停止。", retryable: false },
       });
-    for (const block of this.blocks.values()) block.view?.remove();
+    this.preserveReadingPosition(() => {
+      for (const block of this.blocks.values()) block.view?.remove();
+    });
     this.blocks.clear();
     this.queue.clear();
     this.dirty.clear();
-    void sendMessage<void>({
-      type: "page:progress",
-      progress: {
-        sessionId: this.id,
-        phase: "off",
-        translated: 0,
-        pending: 0,
-        failed: 0,
-      },
-    });
-    void sendMessage<void>({ type: "page:end", sessionId: this.id, reason });
+    if (notify && this.isContextValid()) {
+      void sendMessage<void>({
+        type: "page:progress",
+        progress: {
+          sessionId: this.id,
+          phase: "off",
+          translated: 0,
+          pending: 0,
+          failed: 0,
+        },
+      });
+      void sendMessage<void>({ type: "page:end", sessionId: this.id, reason });
+    }
     this.ended(this);
   }
 
   private readonly isOwned = (node: Node): boolean => this.owned.has(node);
+
+  private preserveReadingPosition(
+    change: () => void,
+    candidates: Iterable<Element> = [],
+  ): void {
+    const blocks = this.blocks;
+    preserveReadingPosition(
+      (function* () {
+        yield* blocks.keys();
+        yield* candidates;
+      })(),
+      this.isOwned,
+      change,
+    );
+  }
+
   private readonly toggle = (event: Event): void => {
     if (event.target instanceof Element && !this.isOwned(event.target))
       this.scheduleScan(event.target, true);
@@ -179,7 +213,22 @@ class PageSession {
   private mutations(records: MutationRecord[]): void {
     if (!this.active) return;
     let changed = false;
+    const removedBlocks = new Set<Block>();
     for (const record of records) {
+      if (consumeSourceMutation(record)) continue;
+      if (record.type === "childList") {
+        for (const removed of record.removedNodes) {
+          const block = this.viewOwners.get(removed);
+          if (
+            block?.view?.host === removed &&
+            !removed.isConnected &&
+            block.element.isConnected
+          ) {
+            this.scheduleScan(block.element, false);
+            changed = true;
+          }
+        }
+      }
       if (this.isOwned(record.target)) continue;
       if (
         record.type === "childList" &&
@@ -207,10 +256,10 @@ class PageSession {
             if (!(removed instanceof Element) || this.isOwned(removed))
               continue;
             const block = this.blocks.get(removed);
-            if (block && !removed.isConnected) this.release(block);
+            if (block && !removed.isConnected) removedBlocks.add(block);
             for (const child of removed.querySelectorAll(BLOCK_SELECTOR)) {
               const nested = this.blocks.get(child);
-              if (nested && !child.isConnected) this.release(nested);
+              if (nested && !child.isConnected) removedBlocks.add(nested);
             }
             for (const root of this.dirty.keys())
               if (!root.isConnected) this.dirty.delete(root);
@@ -218,6 +267,10 @@ class PageSession {
         }
       }
     }
+    if (removedBlocks.size)
+      this.preserveReadingPosition(() => {
+        for (const block of removedBlocks) this.release(block);
+      });
     if (changed) {
       this.navigation.checkArticle();
       this.publish();
@@ -271,15 +324,20 @@ class PageSession {
         for (const candidate of root.querySelectorAll(BLOCK_SELECTOR))
           candidates.add(candidate);
     }
-    for (const element of candidates) {
-      let deferred = false;
-      for (const [root, entry] of this.dirty)
-        if (root === element || (entry.subtree && root.contains(element))) {
-          deferred = true;
-          break;
+    this.preserveReadingPosition(
+      () => {
+        for (const element of candidates) {
+          let deferred = false;
+          for (const [root, entry] of this.dirty)
+            if (root === element || (entry.subtree && root.contains(element))) {
+              deferred = true;
+              break;
+            }
+          if (!deferred) this.refresh(element);
         }
-      if (!deferred) this.refresh(element);
-    }
+      },
+      candidates,
+    );
     this.armScan();
     this.schedulePump();
     this.publish();
@@ -287,6 +345,7 @@ class PageSession {
 
   private refresh(element: Element): void {
     const previous = this.blocks.get(element);
+    previous?.view?.reveal();
     const source = extractSource(element, this.isOwned);
     const declared = element.closest("[lang]")?.getAttribute("lang") ?? "";
     if (!source || isAlreadyTarget(source.text, this.language, declared)) {
@@ -294,6 +353,7 @@ class PageSession {
       return;
     }
     if (previous?.source.signature === source.signature) {
+      previous.source = source;
       previous.dirty = false;
       this.render(previous);
       return;
@@ -315,12 +375,6 @@ class PageSession {
     block.source = source;
     block.revision += 1;
     block.dirty = false;
-    const heading = element
-      .closest("article,section,main")
-      ?.querySelector("h1,h2,h3");
-    const context = (
-      heading ? (extractSource(heading, this.isOwned)?.text ?? "") : ""
-    ).slice(0, 600);
     block.tasks = splitSource(source.text).map((text, index): Task => {
       const existing = oldTasks[index];
       // Editing one part of a long paragraph must not repeat successful, unchanged requests.
@@ -335,7 +389,7 @@ class PageSession {
           id: `${block.id}:${index}`,
           revision: block.revision,
           text,
-          context,
+          context: "",
         },
         state: this.blocked ? "failed" : "queued",
         error: this.blocked,
@@ -404,20 +458,104 @@ class PageSession {
     return oldest;
   }
 
+  private relatedTasks(seed: Task): Task[] {
+    const elements = relatedElements(seed.block.element, this.isOwned);
+    const index = elements.indexOf(seed.block.element);
+    let start = index;
+    let end = index;
+    const usable = (element: Element): boolean => {
+      const block = this.blocks.get(element);
+      return !!block && !block.dirty && block.element.isConnected;
+    };
+    while (start > 0 && usable(elements[start - 1]!)) start -= 1;
+    while (end + 1 < elements.length && usable(elements[end + 1]!)) end += 1;
+    return elements
+      .slice(start, end + 1)
+      .flatMap((element) => this.blocks.get(element)?.tasks ?? []);
+  }
+
+  private batch(seed: Task): Task[] {
+    const related = this.relatedTasks(seed);
+    const eligible = related.filter(
+      (task) => this.queue.has(task) && (!this.blocked || task.manual),
+    );
+    const index = eligible.indexOf(seed);
+    let start = index;
+    let end = index;
+    let chars = seed.segment.text.length;
+    // Keep the priority seed, then include its nearest queued neighbors in document order.
+    while (
+      start > 0 &&
+      end - start + 1 < MAX_BATCH_SEGMENTS &&
+      chars + eligible[start - 1]!.segment.text.length <= MAX_BATCH_CHARS
+    ) {
+      start -= 1;
+      chars += eligible[start]!.segment.text.length;
+    }
+    while (
+      end + 1 < eligible.length &&
+      end - start + 1 < MAX_BATCH_SEGMENTS &&
+      chars + eligible[end + 1]!.segment.text.length <= MAX_BATCH_CHARS
+    ) {
+      end += 1;
+      chars += eligible[end]!.segment.text.length;
+    }
+    const tasks = eligible.slice(start, end + 1);
+    const selected = new Set(tasks);
+    const sources = new Set(tasks.map((task) => task.segment.text));
+    const neighbors: { itemIndex: number; position: string; text: string }[] =
+      [];
+    const seen = new Set<string>();
+    for (const [itemIndex, task] of tasks.entries()) {
+      const offset = related.indexOf(task);
+      for (const direction of [-1, 1]) {
+        const neighbor = related[offset + direction];
+        if (
+          !neighbor ||
+          selected.has(neighbor) ||
+          sources.has(neighbor.segment.text) ||
+          seen.has(neighbor.segment.text)
+        )
+          continue;
+        seen.add(neighbor.segment.text);
+        neighbors.push({
+          itemIndex,
+          position: direction < 0 ? "before" : "after",
+          text: neighbor.segment.text,
+        });
+      }
+    }
+    // One bounded shared hint; the provider emits identical context only once.
+    const entryBudget = Math.floor(1198 / Math.max(1, neighbors.length)) - 1;
+    const hints = neighbors.map((neighbor) => {
+      const overhead = JSON.stringify({ ...neighbor, text: "" }).length;
+      let limit = Math.min(500, entryBudget - overhead);
+      for (;;) {
+        const text = contextExcerpt(
+          neighbor.text,
+          limit,
+          neighbor.position === "before",
+        );
+        const hint = { ...neighbor, text };
+        if (JSON.stringify(hint).length <= entryBudget) return hint;
+        limit = Math.max(1, Math.floor(limit / 2));
+      }
+    });
+    const context = hints.length ? JSON.stringify(hints) : "";
+    for (const task of tasks) task.segment = { ...task.segment, context };
+    return tasks;
+  }
+
   private pump(): void {
     if (!this.active) return;
     while (this.inflight < 2) {
-      const tasks: Task[] = [];
-      let chars = 0;
-      while (tasks.length < MAX_BATCH_SEGMENTS) {
-        const task = this.nextTask();
-        if (!task || chars + task.segment.text.length > MAX_BATCH_CHARS) break;
+      const seed = this.nextTask();
+      if (!seed) break;
+      const tasks = this.batch(seed);
+      for (const task of tasks) {
         this.queue.delete(task);
         task.state = "pending";
-        chars += task.segment.text.length;
-        tasks.push(task);
       }
-      if (!tasks.length) break;
       this.inflight += 1;
       void this.translate(tasks);
     }
@@ -471,9 +609,15 @@ class PageSession {
       !reply.ok &&
       (reply.error.code === "stale" || reply.error.code === "cancelled")
     ) {
-      this.stop("翻译会话已失效，请点击工具栏重新开始。");
+      this.stop("翻译会话已失效，请使用翻译快捷键重新开始。");
       return;
     }
+    this.preserveReadingPosition(() => this.applyTranslation(tasks, reply));
+    this.schedulePump();
+    this.publish();
+  }
+
+  private applyTranslation(tasks: Task[], reply: Reply<BatchResult>): void {
     const translations = new Map<string, Translation>();
     let invalid = false;
     if (reply.ok) {
@@ -541,18 +685,24 @@ class PageSession {
       }
     } else if (manualSucceeded) this.blocked = undefined;
     for (const block of changed) this.render(block);
-    this.schedulePump();
-    this.publish();
   }
 
   private render(block: Block): void {
     if (!this.active || block.dirty || !block.element.isConnected) return;
+    const hasChangedText = block.tasks.some(
+      (task) =>
+        task.state === "translated" &&
+        task.text !== restoreCode(task.segment.text, block.source.codes),
+    );
     const parts = block.tasks.map((task) => ({
       id: task.segment.id,
-      text: task.text,
+      text:
+        !(this.displayMode === "translation" && hasChangedText) &&
+        task.text === restoreCode(task.segment.text, block.source.codes)
+          ? undefined
+          : task.text,
       error: task.error,
-      pending:
-        task.manual && (task.state === "queued" || task.state === "pending"),
+      pending: task.state === "queued" || task.state === "pending",
     }));
     if (
       !parts.some(
@@ -563,36 +713,47 @@ class PageSession {
       block.view = undefined;
       return;
     }
-    if (!block.view?.host.isConnected)
-      block.view = createTranslationView(block.element, this.language, (node) =>
-        this.owned.add(node),
+    if (!block.view?.host.isConnected) {
+      block.view?.remove();
+      block.view = createTranslationView(
+        block.element,
+        this.language,
+        (node) => {
+          this.owned.add(node);
+          this.viewOwners.set(node, block);
+        },
+        this.displayMode,
+        () => block.source.nodes,
       );
-    block.view.update(parts, (id) => {
-      const task = block.tasks.find((candidate) => candidate.segment.id === id);
-      if (
-        !task ||
-        !this.current(task) ||
-        task.state !== "failed" ||
-        block.dirty
-      )
-        return;
-      if (
-        extractSource(block.element, this.isOwned)?.signature !==
-        block.source.signature
-      ) {
-        block.view?.remove();
-        block.view = undefined;
-        this.scheduleScan(block.element, false);
-        return;
-      }
-      task.state = "queued";
-      task.error = undefined;
-      task.manual = true;
-      this.queue.add(task);
-      this.render(block);
-      this.schedulePump();
-      this.publish();
-    });
+    }
+    block.view.update(parts, (id) =>
+      this.preserveReadingPosition(() => {
+        const task = block.tasks.find((candidate) => candidate.segment.id === id);
+        if (
+          !task ||
+          !this.current(task) ||
+          task.state !== "failed" ||
+          block.dirty
+        )
+          return;
+        if (
+          extractSource(block.element, this.isOwned)?.signature !==
+          block.source.signature
+        ) {
+          block.view?.remove();
+          block.view = undefined;
+          this.scheduleScan(block.element, false);
+          return;
+        }
+        task.state = "queued";
+        task.error = undefined;
+        task.manual = true;
+        this.queue.add(task);
+        this.render(block);
+        this.schedulePump();
+        this.publish();
+      }),
+    );
   }
 
   private progress(): PageProgress {
@@ -663,14 +824,25 @@ function isPageMessage(value: unknown): value is PageMessage {
     value.sessionId.length <= 160 &&
     "targetLanguage" in value &&
     typeof value.targetLanguage === "string" &&
-    LANGUAGES.some((language) => language.value === value.targetLanguage)
+    LANGUAGES.some((language) => language.value === value.targetLanguage) &&
+    "displayMode" in value &&
+    (value.displayMode === "bilingual" || value.displayMode === "translation")
   );
 }
 
-export function installContentController(): void {
+export function installContentController(
+  isContextValid: () => boolean,
+): () => void {
+  let disposed = false;
   let session: PageSession | undefined;
-  chrome.runtime.onMessage.addListener((message: unknown, sender, respond) => {
+  const isValid = (): boolean => !disposed && isContextValid();
+  const listener: Parameters<typeof chrome.runtime.onMessage.addListener>[0] = (
+    message: unknown,
+    sender,
+    respond,
+  ) => {
     if (
+      !isValid() ||
       sender.id !== chrome.runtime.id ||
       sender.tab ||
       !isPageMessage(message)
@@ -681,9 +853,11 @@ export function installContentController(): void {
       session = new PageSession(
         message.sessionId,
         message.targetLanguage,
+        message.displayMode,
         (ended) => {
           if (session === ended) session = undefined;
         },
+        isValid,
       );
     } else if (
       message.type === "page:stop" &&
@@ -691,11 +865,30 @@ export function installContentController(): void {
     ) {
       session?.stop(message.reason ?? "用户停止翻译。");
     }
+    if (!isValid()) {
+      // A context can be revoked while the new session is being constructed.
+      session?.stop("页面翻译控制器已卸载。", false);
+      session = undefined;
+      return false;
+    }
     const reply: Reply<PageSnapshot> = {
       ok: true,
       value: session?.snapshot() ?? { active: false },
     };
     respond(reply);
     return false;
-  });
+  };
+  chrome.runtime.onMessage.addListener(listener);
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    session?.stop("页面翻译控制器已卸载。", false);
+    session = undefined;
+    try {
+      chrome.runtime.onMessage.removeListener(listener);
+    } catch (error) {
+      // Chrome may have already revoked this listener's extension context.
+      if (chrome.runtime.id) throw error;
+    }
+  };
 }
