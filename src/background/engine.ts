@@ -122,9 +122,18 @@ export class TranslationEngine {
       checkAbort(session.controller.signal);
       await requireApiPermission(session.settings);
       await session.persist?.();
+      // Ordered companion sources affect meaning even when no explicit hint is needed.
+      // Exclude ephemeral DOM IDs, but invalidate cache entries when any source changes.
+      const contextIdentity = JSON.stringify([
+        segments.map((segment) => segment.text),
+        [...new Set(segments.map((segment) => segment.context))],
+      ]);
       const keys = await Promise.all(
         segments.map((segment) =>
-          translationCacheKey(session.settings, session.fingerprint, segment),
+          translationCacheKey(session.settings, session.fingerprint, {
+            ...segment,
+            context: contextIdentity,
+          }),
         ),
       );
       const cached = await this.state.lookup(keys);
@@ -132,7 +141,7 @@ export class TranslationEngine {
         (_segment, index) => cached.values[index] === undefined,
       );
       const prepared = missing.length
-        ? prepareRequest(session.settings, missing)
+        ? prepareRequest(session.settings, missing, segments)
         : undefined;
       const journalId = `${session.id}:${requestId}`;
       checkAbort(session.controller.signal);

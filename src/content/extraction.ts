@@ -1,4 +1,5 @@
 import { MAX_SEGMENT_CHARS } from "../shared";
+import { containsHiddenSource, readSourceText } from "./source-visibility";
 
 export const BLOCK_SELECTOR =
   "p,h1,h2,h3,h4,h5,h6,li,blockquote,td,th,dd,dt,figcaption,caption,article,main,section,div,button";
@@ -20,6 +21,7 @@ export interface ExtractedSource {
   text: string;
   signature: string;
   codes: string[];
+  nodes: Node[];
 }
 
 export function isReadableElement(
@@ -58,8 +60,10 @@ export function isReadableElement(
     if (clipsX || clipsY) {
       const bounds = current.getBoundingClientRect();
       if (
-        (clipsY && (bounds.height === 0 || style.maxHeight === "0px")) ||
-        (clipsX && (bounds.width === 0 || style.maxWidth === "0px"))
+        (clipsY && style.maxHeight === "0px") ||
+        (clipsX && style.maxWidth === "0px") ||
+        (((clipsY && bounds.height === 0) || (clipsX && bounds.width === 0)) &&
+          !containsHiddenSource(current))
       )
         return false;
     }
@@ -82,6 +86,7 @@ export function extractSource(
   if (!isReadableElement(element, owned)) return undefined;
   const codes: string[] = [];
   const pieces: string[] = [];
+  const nodes: Node[] = [];
   const protect = (text: string): string => {
     const token = `⟦JT_CODE_${codes.length}⟧`;
     codes.push(text);
@@ -90,8 +95,9 @@ export function extractSource(
   const visit = (node: Node): void => {
     if (owned(node)) return;
     if (node.nodeType === Node.TEXT_NODE) {
+      nodes.push(node);
       pieces.push(
-        (node.nodeValue ?? "").replace(CODE_TOKEN, (literal) =>
+        readSourceText(node).replace(CODE_TOKEN, (literal) =>
           protect(literal),
         ),
       );
@@ -108,11 +114,13 @@ export function extractSource(
       node.tagName === "KBD" ||
       node.tagName === "SAMP"
     ) {
-      pieces.push(protect(node.textContent ?? ""));
+      pieces.push(protect(readSourceText(node)));
+      nodes.push(node);
       return;
     }
     if (node.tagName === "BR") {
       pieces.push("\n");
+      nodes.push(node);
       return;
     }
     if (node.matches(BLOCK_SELECTOR)) {
@@ -121,8 +129,22 @@ export function extractSource(
     }
     const blockBoundary = BLOCK_DISPLAYS[getComputedStyle(node).display];
     if (blockBoundary) pieces.push("\n");
+    const nodeStart = nodes.length;
     for (const child of node.childNodes) visit(child);
     if (blockBoundary) pieces.push("\n");
+    // Keep complete inline source groups, without including media,
+    // controls or independently translated blocks.
+    if (
+      nodes.length > nodeStart &&
+      node.matches(
+        "a,abbr,b,bdi,bdo,cite,em,i,mark,q,s,small,span,strong,sub,sup,time,u",
+      ) &&
+      !node.querySelector(
+        `${BLOCK_SELECTOR},${EXCLUDED_SELECTOR},img,picture,details`,
+      )
+    ) {
+      nodes.splice(nodeStart, nodes.length - nodeStart, node);
+    }
   };
   for (const child of element.childNodes) visit(child);
   const text = pieces
@@ -132,7 +154,7 @@ export function extractSource(
     .replace(/\n{3,}/g, "\n\n")
     .trim();
   if (!/\p{L}/u.test(text.replace(CODE_TOKEN, ""))) return undefined;
-  return { text, codes, signature: JSON.stringify([text, codes]) };
+  return { text, codes, nodes, signature: JSON.stringify([text, codes]) };
 }
 
 /** A declared language plus a matching script is stronger evidence than short-word guessing. */

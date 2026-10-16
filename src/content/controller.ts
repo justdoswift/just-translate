@@ -9,6 +9,7 @@ import {
   type PageProgress,
   type Reply,
   type Segment,
+  type Settings,
   type Translation,
 } from "../shared";
 import {
@@ -20,8 +21,10 @@ import {
   splitSource,
   type ExtractedSource,
 } from "./extraction";
+import { contextExcerpt, relatedElements } from "./context";
 import { observeNavigation, type NavigationWatch } from "./navigation";
 import { createTranslationView, type TranslationView } from "./renderer";
+import { consumeSourceMutation, observeSourceChanges } from "./source-visibility";
 
 interface Task {
   segment: Segment;
@@ -102,6 +105,7 @@ class PageSession {
   constructor(
     readonly id: string,
     private readonly language: string,
+    private readonly displayMode: Settings["displayMode"],
     private readonly ended: (session: PageSession) => void,
   ) {
     this.observer = new MutationObserver((records) => this.mutations(records));
@@ -125,6 +129,7 @@ class PageSession {
       attributes: true,
       attributeFilter: ATTRIBUTE_FILTER,
     });
+    observeSourceChanges(true);
     document.addEventListener("toggle", this.toggle, true);
     this.scheduleScan(document.body ?? document.documentElement, true);
     this.publish(true);
@@ -140,6 +145,8 @@ class PageSession {
 
   stop(reason: string): void {
     if (!this.active) return;
+    for (const record of this.observer.takeRecords()) consumeSourceMutation(record);
+    observeSourceChanges(false);
     this.active = false;
     this.observer.disconnect();
     this.intersection.disconnect();
@@ -181,6 +188,7 @@ class PageSession {
     if (!this.active) return;
     let changed = false;
     for (const record of records) {
+      if (consumeSourceMutation(record)) continue;
       if (record.type === "childList") {
         for (const removed of record.removedNodes) {
           const block = this.viewOwners.get(removed);
@@ -301,6 +309,7 @@ class PageSession {
 
   private refresh(element: Element): void {
     const previous = this.blocks.get(element);
+    previous?.view?.reveal();
     const source = extractSource(element, this.isOwned);
     const declared = element.closest("[lang]")?.getAttribute("lang") ?? "";
     if (!source || isAlreadyTarget(source.text, this.language, declared)) {
@@ -308,6 +317,7 @@ class PageSession {
       return;
     }
     if (previous?.source.signature === source.signature) {
+      previous.source = source;
       previous.dirty = false;
       this.render(previous);
       return;
@@ -329,12 +339,6 @@ class PageSession {
     block.source = source;
     block.revision += 1;
     block.dirty = false;
-    const heading = element
-      .closest("article,section,main")
-      ?.querySelector("h1,h2,h3");
-    const context = (
-      heading ? (extractSource(heading, this.isOwned)?.text ?? "") : ""
-    ).slice(0, 600);
     block.tasks = splitSource(source.text).map((text, index): Task => {
       const existing = oldTasks[index];
       // Editing one part of a long paragraph must not repeat successful, unchanged requests.
@@ -349,7 +353,7 @@ class PageSession {
           id: `${block.id}:${index}`,
           revision: block.revision,
           text,
-          context,
+          context: "",
         },
         state: this.blocked ? "failed" : "queued",
         error: this.blocked,
@@ -418,20 +422,104 @@ class PageSession {
     return oldest;
   }
 
+  private relatedTasks(seed: Task): Task[] {
+    const elements = relatedElements(seed.block.element, this.isOwned);
+    const index = elements.indexOf(seed.block.element);
+    let start = index;
+    let end = index;
+    const usable = (element: Element): boolean => {
+      const block = this.blocks.get(element);
+      return !!block && !block.dirty && block.element.isConnected;
+    };
+    while (start > 0 && usable(elements[start - 1]!)) start -= 1;
+    while (end + 1 < elements.length && usable(elements[end + 1]!)) end += 1;
+    return elements
+      .slice(start, end + 1)
+      .flatMap((element) => this.blocks.get(element)?.tasks ?? []);
+  }
+
+  private batch(seed: Task): Task[] {
+    const related = this.relatedTasks(seed);
+    const eligible = related.filter(
+      (task) => this.queue.has(task) && (!this.blocked || task.manual),
+    );
+    const index = eligible.indexOf(seed);
+    let start = index;
+    let end = index;
+    let chars = seed.segment.text.length;
+    // Keep the priority seed, then include its nearest queued neighbors in document order.
+    while (
+      start > 0 &&
+      end - start + 1 < MAX_BATCH_SEGMENTS &&
+      chars + eligible[start - 1]!.segment.text.length <= MAX_BATCH_CHARS
+    ) {
+      start -= 1;
+      chars += eligible[start]!.segment.text.length;
+    }
+    while (
+      end + 1 < eligible.length &&
+      end - start + 1 < MAX_BATCH_SEGMENTS &&
+      chars + eligible[end + 1]!.segment.text.length <= MAX_BATCH_CHARS
+    ) {
+      end += 1;
+      chars += eligible[end]!.segment.text.length;
+    }
+    const tasks = eligible.slice(start, end + 1);
+    const selected = new Set(tasks);
+    const sources = new Set(tasks.map((task) => task.segment.text));
+    const neighbors: { itemIndex: number; position: string; text: string }[] =
+      [];
+    const seen = new Set<string>();
+    for (const [itemIndex, task] of tasks.entries()) {
+      const offset = related.indexOf(task);
+      for (const direction of [-1, 1]) {
+        const neighbor = related[offset + direction];
+        if (
+          !neighbor ||
+          selected.has(neighbor) ||
+          sources.has(neighbor.segment.text) ||
+          seen.has(neighbor.segment.text)
+        )
+          continue;
+        seen.add(neighbor.segment.text);
+        neighbors.push({
+          itemIndex,
+          position: direction < 0 ? "before" : "after",
+          text: neighbor.segment.text,
+        });
+      }
+    }
+    // One bounded shared hint; the provider emits identical context only once.
+    const entryBudget = Math.floor(1198 / Math.max(1, neighbors.length)) - 1;
+    const hints = neighbors.map((neighbor) => {
+      const overhead = JSON.stringify({ ...neighbor, text: "" }).length;
+      let limit = Math.min(500, entryBudget - overhead);
+      for (;;) {
+        const text = contextExcerpt(
+          neighbor.text,
+          limit,
+          neighbor.position === "before",
+        );
+        const hint = { ...neighbor, text };
+        if (JSON.stringify(hint).length <= entryBudget) return hint;
+        limit = Math.max(1, Math.floor(limit / 2));
+      }
+    });
+    const context = hints.length ? JSON.stringify(hints) : "";
+    for (const task of tasks) task.segment = { ...task.segment, context };
+    return tasks;
+  }
+
   private pump(): void {
     if (!this.active) return;
     while (this.inflight < 2) {
-      const tasks: Task[] = [];
-      let chars = 0;
-      while (tasks.length < MAX_BATCH_SEGMENTS) {
-        const task = this.nextTask();
-        if (!task || chars + task.segment.text.length > MAX_BATCH_CHARS) break;
+      const seed = this.nextTask();
+      if (!seed) break;
+      const tasks = this.batch(seed);
+      for (const task of tasks) {
         this.queue.delete(task);
         task.state = "pending";
-        chars += task.segment.text.length;
-        tasks.push(task);
       }
-      if (!tasks.length) break;
       this.inflight += 1;
       void this.translate(tasks);
     }
@@ -561,9 +649,15 @@ class PageSession {
 
   private render(block: Block): void {
     if (!this.active || block.dirty || !block.element.isConnected) return;
+    const hasChangedText = block.tasks.some(
+      (task) =>
+        task.state === "translated" &&
+        task.text !== restoreCode(task.segment.text, block.source.codes),
+    );
     const parts = block.tasks.map((task) => ({
       id: task.segment.id,
       text:
+        !(this.displayMode === "translation" && hasChangedText) &&
         task.text === restoreCode(task.segment.text, block.source.codes)
           ? undefined
           : task.text,
@@ -588,6 +682,8 @@ class PageSession {
           this.owned.add(node);
           this.viewOwners.set(node, block);
         },
+        this.displayMode,
+        () => block.source.nodes,
       );
     }
     block.view.update(parts, (id) => {
@@ -686,7 +782,9 @@ function isPageMessage(value: unknown): value is PageMessage {
     value.sessionId.length <= 160 &&
     "targetLanguage" in value &&
     typeof value.targetLanguage === "string" &&
-    LANGUAGES.some((language) => language.value === value.targetLanguage)
+    LANGUAGES.some((language) => language.value === value.targetLanguage) &&
+    "displayMode" in value &&
+    (value.displayMode === "bilingual" || value.displayMode === "translation")
   );
 }
 
@@ -704,6 +802,7 @@ export function installContentController(): void {
       session = new PageSession(
         message.sessionId,
         message.targetLanguage,
+        message.displayMode,
         (ended) => {
           if (session === ended) session = undefined;
         },

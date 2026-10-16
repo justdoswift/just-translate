@@ -4,7 +4,7 @@ export default defineConfig({
   manifestVersion: 3,
   manifest: {
     name: "Just Translate",
-    description: "用自己的 AI 模型，一键双语翻译当前页，自动补译新加载的内容。",
+    description: "用自己的 AI 模型，一键翻译当前页；支持双语或只显示译文，自动补译新内容。",
     minimum_chrome_version: "120",
     permissions: ["activeTab", "scripting", "storage"],
     optional_host_permissions: [

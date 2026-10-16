@@ -28,6 +28,17 @@ const keyInput = element<HTMLInputElement>("api-key");
 const baseUrlInput = element<HTMLInputElement>("base-url");
 const modelInput = element<HTMLInputElement>("model");
 const languageSelect = element<HTMLSelectElement>("target-language");
+const displayOptions = [
+  element<HTMLInputElement>("display-bilingual"),
+  element<HTMLInputElement>("display-translation"),
+] as const;
+const actions = element<HTMLDivElement>("settings-actions");
+new ResizeObserver(() => {
+  document.documentElement.style.setProperty(
+    "--action-height",
+    `${actions.offsetHeight}px`,
+  );
+}).observe(actions);
 let loadedSettings: Settings = { ...DEFAULT_SETTINGS };
 let keyOrigin = "";
 let busy = false;
@@ -62,6 +73,9 @@ function populate(view: SettingsView): void {
   element<HTMLButtonElement>("show-key").textContent = "显示";
   element<HTMLButtonElement>("show-key").setAttribute("aria-pressed", "false");
   languageSelect.value = view.settings.targetLanguage;
+  for (const option of displayOptions) {
+    option.checked = option.value === view.settings.displayMode;
+  }
   element<HTMLInputElement>("remember-key").checked = view.settings.rememberKey;
   element<HTMLInputElement>("json-mode").checked = view.settings.jsonMode;
   element<HTMLInputElement>("disable-thinking").checked =
@@ -100,6 +114,7 @@ function collectSettings(): Settings {
     baseUrl: normalizeBaseUrl(baseUrlInput.value),
     model: modelInput.value.trim(),
     targetLanguage: languageSelect.value,
+    displayMode: displayOptions[1].checked ? "translation" : "bilingual",
     rememberKey: element<HTMLInputElement>("remember-key").checked,
     jsonMode: element<HTMLInputElement>("json-mode").checked,
     disableThinking: element<HTMLInputElement>("disable-thinking").checked,
@@ -138,6 +153,7 @@ async function submitConfiguration(testConnection: boolean): Promise<void> {
   const activeButton = testConnection ? testButton : saveButton;
   const originalLabel = activeButton.textContent;
   activeButton.textContent = testConnection ? "正在测试…" : "正在保存…";
+  activeButton.setAttribute("aria-busy", "true");
   feedback("");
   try {
     // Must originate in this user gesture, not in a background request.
@@ -191,6 +207,7 @@ async function submitConfiguration(testConnection: boolean): Promise<void> {
     busy = false;
     fields.disabled = false;
     activeButton.textContent = originalLabel;
+    activeButton.removeAttribute("aria-busy");
   }
 }
 

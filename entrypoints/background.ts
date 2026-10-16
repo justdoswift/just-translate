@@ -370,6 +370,7 @@ export default defineBackground(() => {
           type: "page:start",
           sessionId: session.id,
           targetLanguage: view.settings.targetLanguage,
+          displayMode: view.settings.displayMode,
         } satisfies PageMessage,
         { documentId },
       )) as Reply<PageSnapshot>;

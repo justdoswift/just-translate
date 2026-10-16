@@ -1,4 +1,5 @@
-import { sendMessage, type AppError } from "../shared";
+import { sendMessage, type AppError, type DisplayMode } from "../shared";
+import { createSourceVisibility } from "./source-visibility";
 
 export interface RenderedPart {
   id: string;
@@ -10,6 +11,7 @@ export interface RenderedPart {
 export interface TranslationView {
   host: HTMLSpanElement;
   update(parts: readonly RenderedPart[], retry: (id: string) => void): void;
+  reveal(): void;
   remove(): void;
 }
 
@@ -21,11 +23,61 @@ const SETTINGS_ERRORS: Partial<Record<AppError["code"], true>> = {
   quota: true,
 };
 
-/** The only light-DOM addition is a phrasing-content host, valid in paragraphs, lists and cells. */
+const expandedButtons = new WeakMap<
+  HTMLButtonElement,
+  {
+    readers: number;
+    restore: () => void;
+  }
+>();
+
+function expandButton(button: HTMLButtonElement): () => void {
+  let entry = expandedButtons.get(button);
+  if (!entry) {
+    const values = ([
+      ["height", "auto"],
+      ["max-height", "none"],
+      ["overflow", "visible"],
+      ["-webkit-line-clamp", "unset"],
+      ["line-clamp", "unset"],
+    ] as const).map(([property, expanded]) => {
+      const value = button.style.getPropertyValue(property);
+      const priority = button.style.getPropertyPriority(property);
+      button.style.setProperty(property, expanded, "important");
+      return { property, expanded, value, priority };
+    });
+    entry = {
+      readers: 0,
+      restore() {
+        for (const { property, expanded, value, priority } of values) {
+          if (
+            button.style.getPropertyValue(property) !== expanded ||
+            button.style.getPropertyPriority(property) !== "important"
+          )
+            continue;
+          if (value) button.style.setProperty(property, value, priority);
+          else button.style.removeProperty(property);
+        }
+      },
+    };
+    expandedButtons.set(button, entry);
+  }
+  entry.readers += 1;
+  return () => {
+    if (--entry.readers === 0) {
+      entry.restore();
+      expandedButtons.delete(button);
+    }
+  };
+}
+
+/** Preserve original nodes so stopping restores links, controls and site updates. */
 export function createTranslationView(
   element: Element,
   language: string,
   register: (node: Node) => void,
+  displayMode: DisplayMode,
+  readSourceNodes: () => readonly Node[],
 ): TranslationView {
   const host = document.createElement("span");
   register(host);
@@ -62,13 +114,19 @@ export function createTranslationView(
   const content = document.createElement("span");
   content.className = "parts";
   shadow.append(style, content);
+  const source = createSourceVisibility(readSourceNodes);
   const button = element.closest("button");
+  const restoreButton =
+    button && displayMode === "translation" ? expandButton(button) : undefined;
   const restoredStyles: {
     property: string;
     value: string;
     priority: string;
   }[] = [];
-  if (!button && element instanceof HTMLElement) {
+  if (
+    (!button || displayMode === "translation") &&
+    element instanceof HTMLElement
+  ) {
     const computed = getComputedStyle(element);
     for (const property of ["-webkit-line-clamp", "line-clamp"]) {
       if (!(parseInt(computed.getPropertyValue(property), 10) > 0)) continue;
@@ -80,13 +138,21 @@ export function createTranslationView(
       element.style.setProperty(property, "unset", "important");
     }
   }
-  // Compact interactive previews must keep their click target and fixed size.
-  // Render their translation beside the control, not inside its clipped label.
-  if (button) button.after(host);
+  // Translation-only labels stay inside their original clickable control.
+  if (button && displayMode === "bilingual") button.after(host);
   else element.append(host);
   return {
     host,
     update(parts, retry) {
+      if (
+        displayMode === "translation" &&
+        parts.length > 0 &&
+        parts.every(
+          (part) => part.text !== undefined && !part.pending && !part.error,
+        )
+      )
+        source.hide();
+      else source.restore();
       host.setAttribute(
         "aria-busy",
         String(parts.some((part) => part.pending)),
@@ -163,8 +229,11 @@ export function createTranslationView(
         }
       }
     },
+    reveal: () => source.restore(),
     remove() {
+      source.restore();
       host.remove();
+      restoreButton?.();
       if (element instanceof HTMLElement) {
         for (const { property, value, priority } of restoredStyles) {
           // Do not overwrite a later inline style change made by the website.

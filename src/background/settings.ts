@@ -40,6 +40,8 @@ export function validateSettings(value: unknown): Settings {
     !LANGUAGES.some((language) => language.value === item.targetLanguage)
   )
     throw new RequestError("configuration", "请选择支持的目标语言。");
+  if (item.displayMode !== "bilingual" && item.displayMode !== "translation")
+    throw new RequestError("configuration", "请选择支持的显示模式。");
   for (const field of [
     "jsonMode",
     "disableThinking",
@@ -75,6 +77,7 @@ export function validateSettings(value: unknown): Settings {
     baseUrl,
     model: item.model.trim(),
     targetLanguage: item.targetLanguage,
+    displayMode: item.displayMode,
     jsonMode: item.jsonMode as boolean,
     disableThinking: item.disableThinking as boolean,
     rememberKey: item.rememberKey as boolean,
@@ -131,7 +134,10 @@ export class SettingsStore {
     ]);
     if (local[SETTINGS_KEY]) {
       try {
-        this.current = validateSettings(local[SETTINGS_KEY]);
+        this.current = validateSettings({
+          ...DEFAULT_SETTINGS,
+          ...local[SETTINGS_KEY],
+        });
       } catch {
         this.current = { ...DEFAULT_SETTINGS };
       }

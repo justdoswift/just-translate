@@ -1,6 +1,6 @@
-export const APP_VERSION = "0.1.3";
+export const APP_VERSION = "0.2.0";
 export const STARTUP_ERROR_KEY = "justTranslate.startupError";
-export const PROMPT_VERSION = "1";
+export const PROMPT_VERSION = "2";
 export const MAX_BATCH_SEGMENTS = 8;
 export const MAX_BATCH_CHARS = 5500;
 export const MAX_SEGMENT_CHARS = 2400;
@@ -15,11 +15,14 @@ export const LANGUAGES = [
   { value: "es", label: "Español" },
 ] as const;
 
+export type DisplayMode = "bilingual" | "translation";
+
 export interface Settings {
   provider: "deepseek" | "custom";
   baseUrl: string;
   model: string;
   targetLanguage: string;
+  displayMode: DisplayMode;
   jsonMode: boolean;
   disableThinking: boolean;
   rememberKey: boolean;
@@ -36,6 +39,7 @@ export const DEFAULT_SETTINGS: Settings = {
   baseUrl: "https://api.deepseek.com",
   model: "deepseek-flash",
   targetLanguage: "zh-CN",
+  displayMode: "bilingual",
   jsonMode: true,
   disableThinking: true,
   rememberKey: false,
@@ -133,7 +137,12 @@ export type BackgroundMessage =
   | { type: "options:open" };
 
 export type PageMessage =
-  | { type: "page:start"; sessionId: string; targetLanguage: string }
+  | {
+      type: "page:start";
+      sessionId: string;
+      targetLanguage: string;
+      displayMode: DisplayMode;
+    }
   | { type: "page:stop"; sessionId?: string; reason?: string }
   | { type: "page:ping" };
 

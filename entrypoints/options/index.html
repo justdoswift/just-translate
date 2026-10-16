@@ -36,12 +36,7 @@
         <form id="settings-form" autocomplete="off">
           <fieldset id="settings-fields" disabled>
             <section class="section" aria-labelledby="connection-title">
-              <div class="section-heading">
-                <span class="section-number" aria-hidden="true">01</span>
-                <div>
-                  <h2 id="connection-title">模型连接</h2>
-                </div>
-              </div>
+              <h2 id="connection-title">模型连接</h2>
               <div class="section-body">
                 <fieldset class="provider-picker">
                   <legend>服务商</legend>
@@ -122,16 +117,35 @@
               </div>
             </section>
             <section class="section" aria-labelledby="reading-title">
-              <div class="section-heading">
-                <span class="section-number" aria-hidden="true">02</span>
-                <div>
-                  <h2 id="reading-title">阅读偏好</h2>
-                </div>
-              </div>
+              <h2 id="reading-title">阅读偏好</h2>
               <div class="section-body">
-                <label class="field language-field"
-                  >翻译为<select id="target-language"></select
-                ></label>
+                <div class="reading-grid">
+                  <label class="field"
+                    >翻译为<select id="target-language"></select
+                  ></label>
+                  <fieldset class="display-picker">
+                    <legend>显示方式</legend>
+                    <div class="display-options">
+                      <label class="display-option">
+                        <input
+                          id="display-bilingual"
+                          type="radio"
+                          name="displayMode"
+                          value="bilingual"
+                          checked
+                        /><span>双语对照</span>
+                      </label>
+                      <label class="display-option">
+                        <input
+                          id="display-translation"
+                          type="radio"
+                          name="displayMode"
+                          value="translation"
+                        /><span>只显示译文</span>
+                      </label>
+                    </div>
+                  </fieldset>
+                </div>
                 <button
                   id="configure-shortcut"
                   type="button"
@@ -141,75 +155,71 @@
                 </button>
               </div>
             </section>
-            <section class="section" aria-labelledby="data-title">
-              <div class="section-heading">
-                <span class="section-number" aria-hidden="true">03</span>
-                <div>
-                  <h2 id="data-title">缓存与费用</h2>
-                </div>
-              </div>
-              <div class="section-body">
-                <label class="check-row"
-                  ><input id="persistent-cache" type="checkbox" /><span
-                    >持久缓存</span
-                  ></label
-                >
-                <div class="field-grid compact-grid">
-                  <label class="field"
-                    >缓存保留天数<input
-                      id="cache-days"
-                      type="number"
-                      min="1"
-                      max="30"
-                      step="1"
-                      required
-                  /></label>
-                  <label class="field"
-                    >月度费用上限（USD）<input
-                      id="monthly-budget"
-                      type="number"
-                      min="0"
-                      max="10000"
-                      step="0.01"
-                      required
-                  /></label>
-                </div>
-                <details class="advanced">
-                  <summary>计费估算与单页限制</summary>
-                  <div class="detail-body">
-                    <div class="field-grid">
-                      <label class="field"
-                        >输入价格 / 百万 token（USD）<input
-                          id="input-price"
-                          type="number"
-                          min="0"
-                          max="10000"
-                          step="0.001"
-                          required /></label
-                      ><label class="field"
-                        >输出价格 / 百万 token（USD）<input
-                          id="output-price"
-                          type="number"
-                          min="0"
-                          max="10000"
-                          step="0.001"
-                          required
-                      /></label>
-                    </div>
-                    <label class="field language-field"
-                      >单页 token 上限<input
-                        id="page-token-limit"
+            <section
+              class="section section-disclosure"
+              aria-labelledby="data-title"
+            >
+              <details class="advanced">
+                <summary id="data-title">缓存与费用</summary>
+                <div class="detail-body">
+                  <label class="check-row"
+                    ><input id="persistent-cache" type="checkbox" /><span
+                      >持久缓存</span
+                    ></label
+                  >
+                  <div class="field-grid">
+                    <label class="field"
+                      >缓存保留天数<input
+                        id="cache-days"
                         type="number"
-                        min="0"
-                        max="10000000"
+                        min="1"
+                        max="30"
                         step="1"
                         required
                     /></label>
+                    <label class="field"
+                      >月度费用上限（USD）<input
+                        id="monthly-budget"
+                        type="number"
+                        min="0"
+                        max="10000"
+                        step="0.01"
+                        required
+                    /></label>
                   </div>
-                </details>
-              </div>
+                  <div class="field-grid">
+                    <label class="field"
+                      >输入价格 / 百万 token（USD）<input
+                        id="input-price"
+                        type="number"
+                        min="0"
+                        max="10000"
+                        step="0.001"
+                        required
+                    /></label>
+                    <label class="field"
+                      >输出价格 / 百万 token（USD）<input
+                        id="output-price"
+                        type="number"
+                        min="0"
+                        max="10000"
+                        step="0.001"
+                        required
+                    /></label>
+                  </div>
+                  <label class="field language-field"
+                    >单页 token 上限<input
+                      id="page-token-limit"
+                      type="number"
+                      min="0"
+                      max="10000000"
+                      step="1"
+                      required
+                  /></label>
+                </div>
+              </details>
             </section>
-            <div class="actions">
+            <div id="settings-actions" class="actions">
               <p id="form-status" role="status" aria-live="polite"></p>
               <div class="action-buttons">
                 <button
