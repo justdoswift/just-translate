@@ -7,6 +7,8 @@
 要求：Chrome 120+；从源码构建需要 Node.js 22.12+ 和 npm。
 
 ```sh
+git clone https://github.com/justdoswift/just-translate.git
+cd just-translate
 npm ci
 npm run build
 ```
@@ -18,12 +20,6 @@ npm run build
 5. 右键插件图标，选择「选项」，填写自己的 API Key。
 6. 点击「测试连接」，检查译文，然后「保存设置」。测试连接会产生少量 API 用量。
 7. 回到网页，点击插件图标开始翻译。再次点击停止并移除译文。
-
-本机已构建目录：
-
-```text
-/Users/gepeng/Documents/coolweb/chrome-plugins/just-translate/.output/chrome-mv3
-```
 
 更新源码并重新构建后，在 `chrome://extensions` 点击插件的刷新按钮，再刷新需要翻译的网页。
 
@@ -109,3 +105,9 @@ npm run build
 0.1.0 已通过 TypeScript 检查、15 项行为测试及生产构建。Chrome for Testing 156 中已实测一键开关、动态插入、展开、锚点跳转、正文容器替换、过期响应丢弃、停止后迟到响应、后台重启、失败段落重试、429 有界重试、预算阻止发送和标签页隔离。
 
 浏览器验证使用本机受控 OpenAI 兼容测试服务；没有使用用户的真实 API Key，未产生或验证付费 DeepSeek 请求。首次使用请在设置页测试自己的连接。
+
+## 开源许可
+
+本项目采用 [MIT License](LICENSE)，Copyright (c) 2026 Ge Peng。允许使用、修改、商用和再发布；再发布时须保留版权和许可声明。
+
+问题与改进建议请提交到 [GitHub Issues](https://github.com/justdoswift/just-translate/issues)。不要在 Issue、截图或日志中包含 API Key、私密网页正文或个人数据。

@@ -2,6 +2,20 @@
   "name": "just-translate",
   "version": "0.1.0",
   "private": true,
+  "description": "使用自己的 DeepSeek 或 OpenAI 兼容 API，一键双语翻译网页并自动补译动态内容。",
+  "license": "MIT",
+  "author": "Ge Peng",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/justdoswift/just-translate.git"
+  },
+  "homepage": "https://github.com/justdoswift/just-translate#readme",
+  "bugs": {
+    "url": "https://github.com/justdoswift/just-translate/issues"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "type": "module",
   "scripts": {
     "dev": "wxt",
