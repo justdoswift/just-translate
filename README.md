@@ -22,24 +22,18 @@ Just Translate 是一个开源 Chrome 翻译插件。接入 DeepSeek 或 OpenAI 
 
 目前通过「加载已解压的扩展程序」安装，尚未提供 Chrome 应用商店版本。
 
-需要 **Chrome 120+**；从源码构建需要 **Node.js 22.12+**。
+需要 **Chrome 120+**，安装发布包无需 Node.js。
 
-```sh
-git clone https://github.com/justdoswift/just-translate.git
-cd just-translate
-npm ci
-npm run build
-```
-
-1. 打开 `chrome://extensions`，开启「开发者模式」。
-2. 点击「加载已解压的扩展程序」，选择项目中的 **`.output/chrome-mv3`**。
-3. 将 Just Translate 固定到工具栏，左键点击图标打开设置。
-4. 填写模型连接，点击「保存并测试」，允许访问模型 API 域名。
-5. 回到要阅读的普通网页，按 `Option + Q`（Mac）或 `Alt + Q`（Windows / Linux）开始翻译。
+1. 从 [GitHub Releases](https://github.com/justdoswift/just-translate/releases/latest) 下载名称以 `-chrome.zip` 结尾的插件包，解压到固定目录。不要选择 GitHub 自动生成的 `Source code`。
+2. 打开 `chrome://extensions`，开启「开发者模式」。
+3. 点击「加载已解压的扩展程序」，选择包含 **`manifest.json`** 的解压目录。
+4. 将 Just Translate 固定到工具栏，左键点击图标打开设置。
+5. 填写模型连接，点击「保存并测试」，允许访问模型 API 域名。
+6. 回到要阅读的普通网页，按 `Option + Q`（Mac）或 `Alt + Q`（Windows / Linux）开始翻译。
 
 翻译进行中再次按快捷键，会停止任务并恢复原文；已翻译时再次按，也只恢复原文，不叠加新译文。
 
-更新后，重新构建并在扩展管理页重新加载插件，**再刷新网页**。旧版本遗留的重复译文不能只靠重新加载插件清理。
+更新时，将新发布包解压到原插件目录，在扩展管理页重新加载插件，**再刷新网页**。请保留插件目录；删除它会导致插件无法加载。
 
 ### 连接模型
 
@@ -98,11 +92,18 @@ npm run build
 <details>
 <summary>本地开发</summary>
 
+从源码构建需要 **Node.js 22.12+**：
+
 ```sh
-npm run dev
+git clone https://github.com/justdoswift/just-translate.git
+cd just-translate
+npm ci
+npm run build
 npm run typecheck
 npm test
 ```
+
+构建后，在 Chrome 扩展管理页加载 **`.output/chrome-mv3`**；`npm run dev` 用于本地开发。
 
 浏览器回归使用独立的临时配置和本机测试 API，不读取个人 Chrome 数据：
 
