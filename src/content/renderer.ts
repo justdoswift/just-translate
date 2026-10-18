@@ -47,16 +47,21 @@ export function createTranslationView(
   const inlineControl = !!element.closest("button") ||
     (!element.matches("p,h1,h2,h3,h4,h5,h6,blockquote,li,article,main,section") &&
       !!element.closest('a,[role="button"],[role="link"]'));
+  const computed = getComputedStyle(element);
+  const constrainedText = ["-webkit-line-clamp", "line-clamp"].some(
+    (property) => parseInt(computed.getPropertyValue(property), 10) > 0,
+  ) || (computed.textOverflow === "ellipsis" && computed.overflowX !== "visible");
+  const inlineLayout = inlineControl || constrainedText;
   const host = document.createElement("span");
   register(host);
   host.lang = language;
   host.setAttribute("translate", "no");
   host.setAttribute("aria-label", "Just Translate 译文");
-  host.style.setProperty("display", inlineControl ? "inline" : "block", "important");
+  host.style.setProperty("display", inlineLayout ? "inline" : "block", "important");
   host.style.setProperty("font", "inherit", "important");
   host.style.setProperty("color", "inherit", "important");
-  host.style.setProperty("margin-block", inlineControl ? "0" : "0.45em 0.15em", "important");
-  host.style.setProperty("white-space", inlineControl ? "inherit" : "normal", "important");
+  host.style.setProperty("margin-block", inlineLayout ? "0" : "0.45em 0.15em", "important");
+  host.style.setProperty("white-space", inlineLayout ? "inherit" : "normal", "important");
   const shadow = host.attachShadow({ mode: "closed" });
   const style = document.createElement("style");
   style.textContent = `
@@ -78,42 +83,27 @@ export function createTranslationView(
     button:hover { text-decoration: underline; }
     button:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
     button:disabled { cursor: wait; opacity: .7; }
-    ${inlineControl ? `
+    ${inlineLayout ? `
       .parts, .part { display: inline; white-space: inherit; overflow-wrap: normal; }
       .part + .part { margin: 0; }
       .loading { display: inline-flex; min-height: 0; vertical-align: middle; margin-inline-start: .25em; }
+      .loading::before { width: 1em; height: 1em; }
       .error { display: inline; font: inherit; }
       .actions { gap: .25em; margin-inline-start: .25em; vertical-align: baseline; }
-      button { min-height: 0; padding: 0 .25em; line-height: inherit; }
+      button { min-height: 0; padding: 0 .25em; border: 0; line-height: inherit; text-decoration: underline; }
+    ` : ""}
+    ${constrainedText && !inlineControl ? `
+      .loading { margin-inline-start: 0; margin-inline-end: .25em; }
     ` : ""}
   `;
   const content = document.createElement("span");
   content.className = "parts";
   shadow.append(style, content);
   const source = createSourceVisibility(readSourceNodes);
-  const restoredStyles: {
-    property: string;
-    value: string;
-    priority: string;
-  }[] = [];
-  if (
-    !inlineControl &&
-    element instanceof HTMLElement
-  ) {
-    const computed = getComputedStyle(element);
-    for (const property of ["-webkit-line-clamp", "line-clamp"]) {
-      if (!(parseInt(computed.getPropertyValue(property), 10) > 0)) continue;
-      restoredStyles.push({
-        property,
-        value: element.style.getPropertyValue(property),
-        priority: element.style.getPropertyPriority(property),
-      });
-      element.style.setProperty(property, "unset", "important");
-    }
-  }
-  // Controls replace their label in its original layout slot, including bilingual mode.
-  // Paragraphs keep the independent translation row below their source.
-  if (inlineControl) {
+  // Compact labels keep the site's ellipsis and line clamp, even in bilingual mode.
+  // Put their loading indicator first so clipping cannot hide it behind the source.
+  if (constrainedText && !inlineControl) element.prepend(host);
+  else if (inlineControl) {
     const nodes = readSourceNodes();
     const label = controlLabel(element, nodes);
     let lastSource: Node | undefined;
@@ -130,14 +120,10 @@ export function createTranslationView(
   return {
     host,
     update(parts, retry) {
-      if (
-        (displayMode === "translation" || inlineControl) &&
-        parts.length > 0 &&
-        parts.every(
-          (part) => part.text !== undefined && !part.pending && !part.error,
-        )
-      )
-        source.hide();
+      const complete = parts.length > 0 && parts.every(
+        (part) => part.text !== undefined && !part.pending && !part.error,
+      );
+      if ((displayMode === "translation" || inlineLayout) && complete) source.hide();
       else source.restore();
       host.setAttribute(
         "aria-busy",
@@ -149,6 +135,8 @@ export function createTranslationView(
       const rows: HTMLSpanElement[] = [];
       for (const part of parts) {
         if (part.text === undefined && !part.error && !part.pending) continue;
+        // Keep the source readable until the whole compact label can be replaced.
+        if (constrainedText && !complete && part.text !== undefined && !part.pending && !part.error) continue;
         const row = document.createElement("span");
         row.className = "part";
         row.dataset.segment = part.id;
@@ -162,29 +150,29 @@ export function createTranslationView(
         if (part.error) {
           row.classList.add("error");
           row.lang = "zh-CN";
-          const label = document.createElement("span");
+          const label = inlineLayout ? null : document.createElement("span");
           const errorMessage = `此段翻译失败：${part.error.message}${part.error.uncertain ? " 请求结果未确认；重试可能重复计费。" : ""}`;
-          label.textContent = inlineControl ? "翻译失败" : errorMessage;
-          if (inlineControl) row.title = errorMessage;
+          if (label) label.textContent = errorMessage;
+          if (inlineLayout) row.title = errorMessage;
           const actions = document.createElement("span");
           actions.className = "actions";
           const retryButton = document.createElement("button");
           retryButton.type = "button";
-          retryButton.textContent = inlineControl ? "重试" : "重试此段";
-          retryButton.setAttribute("aria-label", inlineControl ? `${errorMessage} 重试翻译` : "仅重试这一段失败的翻译");
+          retryButton.textContent = inlineLayout ? "重试" : "重试此段";
+          retryButton.setAttribute("aria-label", inlineLayout ? `${errorMessage} 重试翻译` : "仅重试这一段失败的翻译");
           retryButton.addEventListener("click", (event) => {
             event.preventDefault();
             event.stopPropagation();
             if (retryButton.disabled) return;
             retryButton.disabled = true;
-            retryButton.textContent = "正在重试…";
+            retryButton.textContent = inlineLayout ? "重试中" : "正在重试…";
             retry(part.id);
           });
           actions.append(retryButton);
           if (SETTINGS_ERRORS[part.error.code]) {
             const settings = document.createElement("button");
             settings.type = "button";
-            settings.textContent = inlineControl ? "设置" : "打开设置";
+            settings.textContent = inlineLayout ? "设置" : "打开设置";
             settings.addEventListener("click", (event) => {
               event.preventDefault();
               event.stopPropagation();
@@ -193,13 +181,17 @@ export function createTranslationView(
               void sendMessage<void>({ type: "options:open" }).then((reply) => {
                 if (!host.isConnected) return;
                 settings.disabled = false;
-                if (!reply.ok)
-                  label.textContent = `无法打开设置：${reply.error.message}`;
+                if (!reply.ok) {
+                  const message = `无法打开设置：${reply.error.message}`;
+                  if (label) label.textContent = message;
+                  else row.title = message;
+                }
               });
             });
             actions.append(settings);
           }
-          row.append(label, actions);
+          if (label) row.append(label);
+          row.append(actions);
         }
         rows.push(row);
       }
@@ -221,18 +213,6 @@ export function createTranslationView(
     remove() {
       source.restore();
       host.remove();
-      if (element instanceof HTMLElement) {
-        for (const { property, value, priority } of restoredStyles) {
-          // Do not overwrite a later inline style change made by the website.
-          if (
-            element.style.getPropertyValue(property) !== "unset" ||
-            element.style.getPropertyPriority(property) !== "important"
-          )
-            continue;
-          if (value) element.style.setProperty(property, value, priority);
-          else element.style.removeProperty(property);
-        }
-      }
     },
   };
 }

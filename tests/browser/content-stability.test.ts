@@ -47,6 +47,8 @@ async function openFixture(t: TestContext, mode: Mode, body: string, held = fals
   const apiErrors: string[] = [];
   const pending = new Set<() => void>();
   let context: BrowserContext | undefined;
+  let rejectPageRequests = false;
+  let completedResponses = 0;
   const release = () => {
     held = false;
     for (const resolve of pending) resolve();
@@ -67,7 +69,13 @@ async function openFixture(t: TestContext, mode: Mode, body: string, held = fals
       const connection = input.items.length === 1 && input.items[0]!.text === connectionText;
       if (!connection) {
         requests.push(input.items.map((item) => item.text));
+        response.once("finish", () => { completedResponses++; });
         if (held) await new Promise<void>((resolve) => pending.add(resolve));
+        if (rejectPageRequests) {
+          response.writeHead(400, { "Content-Type": "application/json" });
+          response.end(JSON.stringify({ error: { message: "Local fixture rejected translation" } }));
+          return;
+        }
       }
       response.writeHead(200, { "Content-Type": "application/json" });
       response.end(JSON.stringify({
@@ -138,6 +146,7 @@ async function openFixture(t: TestContext, mode: Mode, body: string, held = fals
     worker,
     requests,
     release,
+    rejectRequests: () => { rejectPageRequests = true; },
     toggle: () => dispatchTranslationCommand(worker, page),
     async rendered(sources: string[]) {
       const expected = sources.map(translated).sort();
@@ -154,6 +163,9 @@ async function openFixture(t: TestContext, mode: Mode, body: string, held = fals
           expected,
           actual,
           requests,
+          held,
+          pendingResponses: pending.size,
+          completedResponses,
           hosts: await page.locator(hostSelector).evaluateAll((nodes) =>
             nodes.map((node) => ({ busy: node.getAttribute("aria-busy"), text: node.textContent }))),
           sessions: await worker.evaluate(() => chrome.storage.session.get("justTranslate.sessions")),
@@ -278,6 +290,103 @@ for (const mode of ["bilingual", "translation"] as const) {
     await fixture.stopped();
     assert.equal(await page.locator("#control").innerHTML(), original);
     assert.equal(await page.evaluate("window.sourceNode === document.getElementById('control').firstChild"), true);
+  });
+
+  test(`${mode}: constrained recommendation cards keep their layout`, { timeout: 45_000 }, async (t) => {
+    const cards = [
+      ["Alexander Montgomery writes about science", "Followed by Cameron Wolfe, Marcel Melzig and Kavita Gupta"],
+      ["Stephanie Koe", "Followed by Dan"],
+      ["Simon Sinek", "Followed by Marcel Melzig"],
+    ];
+    const paragraph = "An ordinary article paragraph keeps its independent translation row.";
+    const fixture = await openFixture(t, mode, `<style>
+      body { font-family: Arial, sans-serif; }
+      .cards { display: flex; gap: 8px; }
+      .card { box-sizing: border-box; display: flex; flex-direction: column; gap: 12px; padding: 12px; justify-content: space-between; align-items: center; width: 176px; min-width: 176px; height: 234px; border: 1px solid; }
+      .avatar { width: 100px; height: 100px; flex: 0 0 auto; border-radius: 50%; background: gray; }
+      .info { display: flex; flex-direction: column; gap: 4px; flex: 1 1 1px; min-width: 0; align-self: stretch; }
+      .name-row { display: flex; gap: 4px; align-items: center; justify-content: center; }
+      .name { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 13px; line-height: 20px; }
+      .badge { width: 12px; height: 12px; flex: 0 0 auto; background: gray; }
+      .mutuals { display: flex; gap: 6px; align-items: center; justify-content: center; margin-top: 4px; }
+      .summary { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; font-size: 11px; line-height: 13px; text-align: center; }
+      .follow { display: flex; align-items: center; justify-content: center; gap: 6px; align-self: stretch; height: 32px; padding: 0 8px; white-space: nowrap; font: 13px/20px Arial; }
+    </style><div class="cards">${cards.map(([name, summary]) => `<div class="card">
+      <div class="avatar" aria-hidden="true"></div>
+      <div class="info"><div class="name-row"><div class="name">${name}</div><span class="badge" aria-hidden="true"></span></div>
+      <div class="mutuals"><div class="summary">${summary}</div></div></div>
+      <button class="follow">Follow</button>
+    </div>`).join("")}</div><p id="paragraph">${paragraph}</p>`, true);
+    const { page } = fixture;
+    const original = await page.locator(".cards").innerHTML();
+    const originalName = await page.locator(".name").first().evaluateHandle((node) => node.firstChild!);
+    await page.evaluate(`window.followClicks = 0;
+      document.querySelector(".follow").addEventListener("click", () => window.followClicks++);`);
+    const geometry = () => page.locator(".card").evaluateAll((nodes) => nodes.map((node) => {
+      const name = node.querySelector(".name")!.getBoundingClientRect();
+      const summary = node.querySelector(".summary")!.getBoundingClientRect();
+      const button = node.querySelector(".follow")!.getBoundingClientRect();
+      const badge = node.querySelector(".badge")!.getBoundingClientRect();
+      return {
+        height: node.getBoundingClientRect().height,
+        nameHeight: name.height,
+        summaryHeight: summary.height,
+        clamp: getComputedStyle(node.querySelector(".summary")!).webkitLineClamp,
+        buttonHeight: button.height,
+        buttonBottom: button.bottom - node.getBoundingClientRect().bottom,
+        badgeOffset: badge.y - name.y,
+      };
+    }));
+    const before = await geometry();
+    const assertLayout = async (stage: string) => {
+      const after = await geometry();
+      after.forEach((card, index) => {
+        assert.equal(card.height, before[index]!.height, `${stage}: card height`);
+        assert.equal(card.nameHeight, before[index]!.nameHeight, `${stage}: one-line name`);
+        assert.equal(card.clamp, "2", `${stage}: preserve native line clamp`);
+        assert.ok(card.summaryHeight <= 26, `${stage}: summary must stay within two lines`);
+        assert.ok(card.buttonHeight >= before[index]!.buttonHeight - 2, `${stage}: do not squeeze the button`);
+        assert.ok(card.buttonBottom <= -1, `${stage}: button must remain inside the card`);
+        assert.equal(card.badgeOffset, before[index]!.badgeOffset, `${stage}: badge alignment`);
+      });
+    };
+    await fixture.toggle();
+    await page.locator(`.summary ${hostSelector}[aria-busy="true"]`).first().waitFor();
+    await assertLayout("loading");
+    assert.equal(await originalName.evaluate((node) => node.nodeValue), cards[0]![0],
+      "keep the original readable while the translation is pending");
+    fixture.release();
+    await fixture.rendered([...cards.flatMap(([name, summary]) => [name!, summary!, "Follow"]), paragraph]);
+    await assertLayout("translated");
+    assert.equal(await originalName.evaluate((node) => node.nodeValue), "",
+      "constrained labels replace the source in both display modes");
+    assert.equal(await page.locator("#paragraph").evaluate((node) => node.firstChild!.nodeValue),
+      mode === "bilingual" ? paragraph : "", "ordinary paragraphs still honor the display mode");
+    await page.locator(".follow").first().click();
+    assert.equal(await page.evaluate("window.followClicks"), 1);
+    await fixture.toggle();
+    await fixture.stopped();
+    assert.equal(await page.locator(".cards").innerHTML(), original);
+    assert.deepEqual(await geometry(), before, "restoring the source must restore the original layout");
+    assert.equal(await originalName.evaluate((node) => node === document.querySelector(".name")!.firstChild), true);
+    await originalName.dispose();
+    // New source labels bypass successful caches and exercise compact error actions.
+    await page.locator(".name, .summary, .follow").evaluateAll((nodes) => {
+      for (const node of nodes) node.textContent = `Changed ${node.textContent}`;
+    });
+    const updated = await page.locator(".cards").innerHTML();
+    fixture.rejectRequests();
+    await fixture.toggle();
+    await page.waitForFunction((selector) =>
+      document.querySelectorAll(selector).length === 10 &&
+      !document.querySelector(`${selector}[aria-busy="true"]`), hostSelector);
+    await assertLayout("failed");
+    assert.equal(await page.locator(".name").first().textContent(), `Changed ${cards[0]![0]}`,
+      "failed labels must retain their original text");
+    await fixture.toggle();
+    await fixture.stopped();
+    assert.equal(await page.locator(".cards").innerHTML(), updated,
+      "stopping after a failure must preserve the website's new labels");
   });
 
   test(`${mode}: changing excluded roles discovers newly readable content`, { timeout: 45_000 }, async (t) => {

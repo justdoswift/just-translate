@@ -360,17 +360,17 @@ for (const displayMode of ["bilingual", "translation"] as const) {
         .evaluate((host) => host.remove());
       await waitForTranslations([...translations.values()].slice(0, 3));
       if (displayMode === "translation") {
-        await page.locator("#clamped").evaluate((node) => {
+        const replacementSource = await page.locator("#clamped").evaluateHandle((node) => {
           node.textContent = "A two-line card hides appended translations.";
+          return node.firstChild!;
         });
         await waitForTranslations([...translations.values()].slice(0, 3));
-        const replacementHidden = await page
-          .locator("#clamped")
-          .evaluate((node) => {
-            const range = document.createRange();
-            range.selectNodeContents(node.firstChild!);
-            return range.getBoundingClientRect().height === 0;
-          });
+        const replacementHidden = await replacementSource.evaluate((node) => {
+          const range = document.createRange();
+          range.selectNodeContents(node);
+          return range.getBoundingClientRect().height === 0;
+        });
+        await replacementSource.dispose();
         assert.equal(
           replacementHidden,
           true,
