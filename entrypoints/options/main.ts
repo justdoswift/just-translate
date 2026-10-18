@@ -79,6 +79,9 @@ function populate(view: SettingsView): void {
   element<HTMLInputElement>("cache-days").value = String(
     view.settings.cacheDays,
   );
+  element<HTMLInputElement>("max-concurrent-requests").value = String(
+    view.settings.maxConcurrentRequests,
+  );
   element<HTMLInputElement>("monthly-budget").value = String(
     view.settings.monthlyBudgetUsd,
   );
@@ -114,6 +117,8 @@ function collectSettings(): Settings {
     disableThinking: element<HTMLInputElement>("disable-thinking").checked,
     persistentCache: element<HTMLInputElement>("persistent-cache").checked,
     cacheDays: element<HTMLInputElement>("cache-days").valueAsNumber,
+    maxConcurrentRequests:
+      element<HTMLInputElement>("max-concurrent-requests").valueAsNumber,
     monthlyBudgetUsd: element<HTMLInputElement>("monthly-budget").valueAsNumber,
     inputPricePerMillion:
       element<HTMLInputElement>("input-price").valueAsNumber,

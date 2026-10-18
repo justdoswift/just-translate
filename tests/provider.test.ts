@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test, { after, before } from "node:test";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { DEFAULT_SETTINGS, type Segment } from "../src/shared";
 import { RequestError } from "../src/background/errors";
 import { prepareRequest, requestTranslation } from "../src/background/provider";
@@ -198,6 +199,7 @@ test("truncated responses are rejected but their reported usage is retained", as
 
 test("explicit rate limiting has a bounded retry, not an infinite request loop", async (t) => {
   let dispatches = 0;
+  const delays: number[] = [];
   const fetchMock = t.mock.method(
     globalThis,
     "fetch",
@@ -213,6 +215,7 @@ test("explicit rate limiting has a bounded retry, not an infinite request loop",
       async () => {
         dispatches++;
       },
+      (delay) => { delays.push(delay); },
     ),
     (error: unknown) =>
       error instanceof RequestError &&
@@ -221,9 +224,11 @@ test("explicit rate limiting has a bounded retry, not an infinite request loop",
   );
   assert.equal(fetchMock.mock.callCount(), 2);
   assert.equal(dispatches, 2);
+  assert.deepEqual(delays, [250, 250]);
 });
 
 test("ambiguous server failures do not automatically create a second billable request", async (t) => {
+  let released = 0;
   const fetchMock = t.mock.method(
     globalThis,
     "fetch",
@@ -239,6 +244,8 @@ test("ambiguous server failures do not automatically create a second billable re
       prepareRequest(DEFAULT_SETTINGS, segments),
       new AbortController().signal,
       async () => {},
+      undefined,
+      async () => () => { released++; },
     ),
     (error: unknown) =>
       error instanceof RequestError &&
@@ -246,6 +253,7 @@ test("ambiguous server failures do not automatically create a second billable re
       !error.message.includes("private upstream"),
   );
   assert.equal(fetchMock.mock.callCount(), 1);
+  assert.equal(released, 1);
 });
 
 test("cancellation before dispatch sends nothing to the model", async (t) => {
@@ -266,4 +274,73 @@ test("cancellation before dispatch sends nothing to the model", async (t) => {
       error instanceof RequestError && error.detail.code === "cancelled",
   );
   assert.equal(fetchMock.mock.callCount(), 0);
+});
+
+test("Retry-After delays the sole permitted retry and reports the same cooldown", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.UTC(2026, 0, 1) });
+  let notify!: (delay: number) => void;
+  const notified = new Promise<number>((resolve) => { notify = resolve; });
+  let attempts = 0;
+  let acquired = 0;
+  let released = 0;
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => {
+    if (++attempts === 1)
+      return new Response("{}", { status: 429, headers: { "Retry-After": "2" } });
+    return providerResponse(JSON.stringify({
+      items: [{ id: segments[0]!.id, text: "保留 ⟦JT_CODE_0⟧。" }],
+    }));
+  });
+  const result = requestTranslation(
+    DEFAULT_SETTINGS, "test-key", prepareRequest(DEFAULT_SETTINGS, segments),
+    new AbortController().signal, async () => {}, notify,
+    async (signal) => {
+      assert.equal(signal.aborted, false);
+      assert.equal(acquired, released);
+      acquired++;
+      return () => { released++; };
+    },
+  );
+  assert.equal(await notified, 2000);
+  assert.equal(acquired, 1);
+  assert.equal(released, 1, "429 releases HTTP capacity before sleeping");
+  t.mock.timers.tick(1999);
+  await nextTurn();
+  assert.equal(fetchMock.mock.callCount(), 1);
+  t.mock.timers.tick(1);
+  assert.equal((await result).items[0]!.translation, "保留 ⟦JT_CODE_0⟧。");
+  assert.equal(fetchMock.mock.callCount(), 2);
+  assert.equal(acquired, 2);
+  assert.equal(released, 2, "successful retries release capacity exactly once");
+});
+
+for (const retryAfter of ["60", "Thu, 01 Jan 2026 00:01:00 GMT", "invalid-date"]) {
+  test(`a non-retryable Retry-After window still informs the scheduler (${retryAfter})`, async (t) => {
+    t.mock.method(Date, "now", () => Date.UTC(2026, 0, 1));
+    const delays: number[] = [];
+    const fetchMock = t.mock.method(globalThis, "fetch", async () =>
+      new Response("{}", { status: 429, headers: { "Retry-After": retryAfter } }));
+    await assert.rejects(requestTranslation(
+      DEFAULT_SETTINGS, "test-key", prepareRequest(DEFAULT_SETTINGS, segments),
+      new AbortController().signal, async () => {},
+      (delay) => { delays.push(delay); },
+    ), (error: unknown) => error instanceof RequestError &&
+      error.detail.code === "rate_limit" && !error.detail.uncertain);
+    assert.deepEqual(delays, [retryAfter === "invalid-date" ? 1000 : 60_000]);
+    assert.equal(fetchMock.mock.callCount(), 1);
+  });
+}
+
+test("cancelling an explicit 429 wait never dispatches the retry or claims uncertain billing", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.UTC(2026, 0, 1) });
+  const controller = new AbortController();
+  const fetchMock = t.mock.method(globalThis, "fetch", async () =>
+    new Response("{}", { status: 429, headers: { "Retry-After": "8" } }));
+  await assert.rejects(requestTranslation(
+    DEFAULT_SETTINGS, "test-key", prepareRequest(DEFAULT_SETTINGS, segments),
+    controller.signal, async () => {}, () => { controller.abort(); },
+  ), (error: unknown) => error instanceof RequestError &&
+    error.detail.code === "cancelled" && !error.detail.uncertain);
+  t.mock.timers.tick(30_000);
+  await nextTurn();
+  assert.equal(fetchMock.mock.callCount(), 1);
 });

@@ -25,7 +25,6 @@ type Scenario = (typeof scenarios)[number];
 interface Fixture {
   html: string;
   translations: Map<string, string>;
-  requested: Set<string>;
   requestCount: number;
   held: boolean;
   pending: Set<() => void>;
@@ -82,7 +81,6 @@ function articleFixture(scenario: Scenario): Fixture {
       <article>${paragraphs}</article><footer translate="no"></footer>
       ${nested ? "</div>" : ""}</html>`,
     translations,
-    requested: new Set(),
     requestCount: 0,
     held: true,
     pending: new Set(),
@@ -198,7 +196,6 @@ for (const displayMode of ["bilingual", "translation"] as const) {
         if (!connection && !fixture) throw new Error("Unexpected source text reached the local model");
         if (fixture) {
           fixture.requestCount++;
-          for (const item of input.items) fixture.requested.add(item.text);
           if (fixture.held) await new Promise<void>((resolve) => {
             fixture.pending.add(resolve);
             fixture.events.emit("held");
@@ -329,14 +326,14 @@ for (const displayMode of ["bilingual", "translation"] as const) {
         }, paragraphCount, { polling: "raf", timeout: 30_000 });
         await settleLayout(page);
         assert.deepEqual(apiErrors, [], "all requests must use the controlled local model");
-        assert.equal(fixture.requested.size, paragraphCount, "all paragraphs must reach the real model request flow");
         assert.ok(fixture.requestCount > 1, "the fixture must span multiple translation batches");
         const pageCdp = await context!.newCDPSession(page);
         const { root } = await pageCdp.send("DOM.getDocument", { depth: -1, pierce: true });
         const rendered = new Set(renderedText(root));
         await pageCdp.detach();
         for (const text of fixture.translations.values()) {
-          assert.ok(rendered.has(text), "every controlled translation must render successfully, not as an error");
+          assert.ok(rendered.has(text),
+            `missing translation: ${text}; errors: ${[...rendered].filter((value) => /失败|上限|预算|错误/.test(value)).join(" | ")}`);
         }
         const translated = await readingPosition(page, paragraph);
         if (atTop) assert.equal(translated.windowY, 0, "completed translations must leave document top at zero");

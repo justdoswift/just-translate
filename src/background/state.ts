@@ -6,7 +6,7 @@ import {
   type Usage,
   type UsageView,
 } from "../shared";
-import { RequestError, type TokenUsage } from "./errors";
+import { RequestError, abortError, checkAbort, type TokenUsage } from "./errors";
 import { accountFingerprint } from "./settings";
 
 const STATE_KEY = "justTranslate.accounting";
@@ -14,6 +14,7 @@ const CACHE_KEY = "justTranslate.cache";
 const RESULTS_KEY = "justTranslate.responses";
 const CACHE_MAX_ENTRIES = 400;
 const CACHE_MAX_BYTES = 2_000_000;
+const BUDGET_WAIT_TIMEOUT_MS = 30_000;
 interface CacheEntry {
   key: string;
   text: string;
@@ -53,6 +54,14 @@ function emptyUsage(month: string): Usage {
   };
 }
 
+function budgetWaitTimeout(): RequestError {
+  return new RequestError(
+    "rate_limit",
+    "等待预算预留释放超过 30 秒，请稍后手动重试；此请求尚未发送。",
+    true,
+  );
+}
+
 export async function translationCacheKey(
   settings: Settings,
   fingerprint: string,
@@ -86,6 +95,7 @@ export class TranslationState {
   private persistent = false;
   private cacheDays = 7;
   private cacheGeneration = 0;
+  private budgetWaiters = new Set<(error?: RequestError) => void>();
 
   private async exclusive<T>(operation: () => Promise<T>): Promise<T> {
     const pending = this.serial.then(operation, operation);
@@ -252,66 +262,116 @@ export class TranslationState {
     settings: Settings,
     inputBound: number,
     outputBound: number,
+    signal: AbortSignal,
   ): Promise<void> {
-    await this.exclusive(async () => {
-      if (this.state.journal.some((entry) => entry.id === id))
-        throw new RequestError(
-          "interrupted",
-          "该请求标识已使用；不会重复发送。请显式重试以创建新请求。",
-          true,
-        );
-      const month = new Date().toISOString().slice(0, 7);
-      const usage = this.state.months[month] ?? emptyUsage(month);
-      const cost =
-        (inputBound * settings.inputPricePerMillion +
-          outputBound * settings.outputPricePerMillion) /
-        1_000_000;
-      const reservedCost = this.state.journal.reduce(
-        (sum, entry) =>
-          sum +
-          (entry.month === month &&
-          (entry.status === "reserved" || entry.status === "sent")
-            ? (entry.inputBound * entry.inputRate +
+    let deadline: number | undefined;
+    for (;;) {
+      checkAbort(signal);
+      const waiting = await this.exclusive(async () => {
+        checkAbort(signal);
+        if (deadline !== undefined && Date.now() >= deadline)
+          throw budgetWaitTimeout();
+        if (this.state.journal.some((entry) => entry.id === id))
+          throw new RequestError(
+            "interrupted",
+            "该请求标识已使用；不会重复发送。请显式重试以创建新请求。",
+            true,
+          );
+        const month = new Date().toISOString().slice(0, 7);
+        const usage = this.state.months[month] ?? emptyUsage(month);
+        const tokens = inputBound + outputBound;
+        const cost =
+          (inputBound * settings.inputPricePerMillion +
+            outputBound * settings.outputPricePerMillion) /
+          1_000_000;
+        let reservedCost = 0;
+        let reservedPageTokens = 0;
+        for (const entry of this.state.journal) {
+          if (entry.status !== "reserved" && entry.status !== "sent") continue;
+          if (entry.month === month)
+            reservedCost +=
+              (entry.inputBound * entry.inputRate +
                 entry.outputBound * entry.outputRate) /
-              1_000_000
-            : 0),
-        0,
-      );
-      if (
-        inputBound + outputBound > 0 &&
-        settings.monthlyBudgetUsd > 0 &&
-        usage.estimatedCostUsd + reservedCost + cost > settings.monthlyBudgetUsd
-      ) {
-        throw new RequestError(
-          "budget",
-          "本月预算不足以安全预留此次请求；请在设置中检查用量或调整预算。",
-        );
-      }
-      const used = this.state.pages[page] ?? 0;
-      if (
-        inputBound + outputBound > 0 &&
-        settings.pageTokenLimit > 0 &&
-        used + inputBound + outputBound > settings.pageTokenLimit
-      )
-        throw new RequestError(
-          "budget",
-          "本页 Token 上限不足以预留下一批翻译；已保留现有结果。",
-        );
-      this.state.pages[page] = used + inputBound + outputBound;
-      this.state.journal.push({
-        id,
-        page,
-        month,
-        status: "reserved",
-        created: Date.now(),
-        inputBound,
-        outputBound,
-        inputRate: settings.inputPricePerMillion,
-        outputRate: settings.outputPricePerMillion,
-        attempts: 0,
+              1_000_000;
+          if (entry.page === page)
+            reservedPageTokens += entry.inputBound + entry.outputBound;
+        }
+        const used = this.state.pages[page] ?? 0;
+        const monthlyBlocked =
+          tokens > 0 &&
+          settings.monthlyBudgetUsd > 0 &&
+          usage.estimatedCostUsd + reservedCost + cost > settings.monthlyBudgetUsd;
+        const pageBlocked =
+          tokens > 0 &&
+          settings.pageTokenLimit > 0 &&
+          used + tokens > settings.pageTokenLimit;
+        if (
+          monthlyBlocked &&
+          usage.estimatedCostUsd + cost > settings.monthlyBudgetUsd
+        )
+          throw new RequestError(
+            "budget",
+            "本月预算不足以安全预留此次请求；请在设置中检查用量或调整预算。",
+          );
+        if (
+          pageBlocked &&
+          Math.max(0, used - reservedPageTokens) + tokens > settings.pageTokenLimit
+        )
+          throw new RequestError(
+            "budget",
+            "本页 Token 上限不足以预留下一批翻译；已保留现有结果。",
+          );
+        if (monthlyBlocked || pageBlocked) {
+          deadline ??= Date.now() + BUDGET_WAIT_TIMEOUT_MS;
+          // Register under the mutex, but await settlement only after releasing it.
+          return this.waitForBudget(signal, deadline);
+        }
+        this.state.pages[page] = used + tokens;
+        this.state.journal.push({
+          id,
+          page,
+          month,
+          status: "reserved",
+          created: Date.now(),
+          inputBound,
+          outputBound,
+          inputRate: settings.inputPricePerMillion,
+          outputRate: settings.outputPricePerMillion,
+          attempts: 0,
+        });
+        await this.persistState();
       });
-      await this.persistState();
+      if (!waiting) return;
+      await waiting.wait;
+    }
+  }
+
+  private waitForBudget(
+    signal: AbortSignal,
+    deadline: number,
+  ): { wait: Promise<void> } {
+    const wait = new Promise<void>((resolve, reject) => {
+      const settle = (error?: RequestError): void => {
+        if (!this.budgetWaiters.delete(settle)) return;
+        clearTimeout(timer);
+        signal.removeEventListener("abort", cancel);
+        if (error) reject(error);
+        else resolve();
+      };
+      const cancel = (): void => settle(abortError());
+      const timer = setTimeout(
+        () => settle(budgetWaitTimeout()),
+        Math.max(0, deadline - Date.now()),
+      );
+      this.budgetWaiters.add(settle);
+      signal.addEventListener("abort", cancel, { once: true });
+      if (signal.aborted) cancel();
     });
+    return { wait };
+  }
+
+  private notifyBudgetWaiters(error?: RequestError): void {
+    for (const settle of this.budgetWaiters) settle(error);
   }
 
   async dispatch(id: string): Promise<void> {
@@ -339,12 +399,7 @@ export class TranslationState {
           true,
           true,
         );
-      this.account(entry, result, false);
-      (this.state.months[entry.month] ??= emptyUsage(entry.month)).cacheHits +=
-        result.translations.filter((translation) => translation.cached).length;
-      entry.status = "completed";
-      entry.result = result;
-      await this.persistState();
+      await this.settle(entry, result, false, result);
     });
   }
 
@@ -363,9 +418,7 @@ export class TranslationState {
               estimated: true,
             }
           : { inputTokens: 0, outputTokens: 0, estimated: false });
-      this.account(entry, usage, unknown);
-      entry.status = unknown ? "unknown" : "failed";
-      await this.persistState();
+      await this.settle(entry, usage, unknown);
     });
   }
 
@@ -379,6 +432,50 @@ export class TranslationState {
         if (!active.has(page)) delete this.state.pages[page];
       await this.persistState();
     });
+  }
+
+  private async settle(
+    entry: JournalEntry,
+    tokens: TokenUsage,
+    unknown: boolean,
+    result?: BatchResult,
+  ): Promise<void> {
+    const previousUsage = this.state.months[entry.month];
+    const usageSnapshot = previousUsage ? { ...previousUsage } : undefined;
+    const previousPage = this.state.pages[entry.page];
+    const previousStatus = entry.status;
+    const previousResult = entry.result;
+    const previousJournal = this.state.journal;
+    this.account(entry, tokens, unknown);
+    if (result) {
+      this.state.months[entry.month]!.cacheHits += result.translations.filter(
+        (translation) => translation.cached,
+      ).length;
+      entry.result = result;
+    }
+    entry.status = result ? "completed" : unknown ? "unknown" : "failed";
+    try {
+      await this.persistState();
+    } catch (error) {
+      // A failed durable write must not expose released capacity to another request.
+      this.state.journal = previousJournal;
+      if (usageSnapshot) this.state.months[entry.month] = usageSnapshot;
+      else delete this.state.months[entry.month];
+      if (previousPage !== undefined && Object.hasOwn(this.state.pages, entry.page))
+        this.state.pages[entry.page] = previousPage;
+      entry.status = previousStatus;
+      if (previousResult) entry.result = previousResult;
+      else delete entry.result;
+      this.notifyBudgetWaiters(
+        new RequestError(
+          "internal",
+          "无法持久保存预算结算；等待中的请求尚未发送，请检查扩展存储后重试。",
+          true,
+        ),
+      );
+      throw error;
+    }
+    this.notifyBudgetWaiters();
   }
 
   private account(

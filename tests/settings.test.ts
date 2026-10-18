@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
 import { DEFAULT_SETTINGS } from "../src/shared";
-import { SettingsStore } from "../src/background/settings";
+import { SettingsStore, validateSettings } from "../src/background/settings";
 
 function storageArea(initial: Record<string, unknown>) {
   const values = structuredClone(initial);
@@ -23,14 +23,14 @@ function storageArea(initial: Record<string, unknown>) {
   };
 }
 
-test("upgrading settings keeps the provider, budget and session key while adding display mode", async (t) => {
+test("upgrading settings keeps the provider, budget and session key while adding display mode and concurrency", async (t) => {
   const originalChrome = Object.getOwnPropertyDescriptor(globalThis, "chrome");
   t.after(() => {
     if (originalChrome)
       Object.defineProperty(globalThis, "chrome", originalChrome);
     else Reflect.deleteProperty(globalThis, "chrome");
   });
-  const { displayMode: _, ...legacy } = {
+  const { displayMode: _, maxConcurrentRequests: __, ...legacy } = {
     ...DEFAULT_SETTINGS,
     provider: "custom" as const,
     baseUrl: "https://model.example/v1",
@@ -50,7 +50,7 @@ test("upgrading settings keeps the provider, budget and session key while adding
   const store = new SettingsStore();
   await store.initialize();
   assert.deepEqual(store.view(), {
-    settings: { ...legacy, displayMode: "bilingual" },
+    settings: { ...legacy, displayMode: "bilingual", maxConcurrentRequests: 4 },
     apiKey: "test-session-key",
     configured: true,
   });
@@ -185,3 +185,53 @@ test("a later failed save cannot replace an already committed session credential
   await restarted.initialize();
   assert.deepEqual(restarted.view(), committed);
 });
+
+for (const value of [0, -1, 9, 1.5, NaN, Infinity, -Infinity, "4", "", null, undefined]) {
+  test(`concurrency rejects invalid value ${String(value)}`, () => {
+    assert.throws(
+      () => validateSettings({ ...DEFAULT_SETTINGS, maxConcurrentRequests: value }),
+      /maxConcurrentRequests/,
+    );
+  });
+}
+
+for (const maxConcurrentRequests of [1, 8]) {
+  for (const rememberKey of [false, true]) {
+    test(`concurrency ${maxConcurrentRequests} persists across restart (remember=${rememberKey})`, async (t) => {
+      const { settings, local } = installStorage(t, rememberKey);
+      const store = new SettingsStore();
+      await store.initialize();
+      const next = { ...settings, maxConcurrentRequests };
+      const saved = await store.save(next, "previous-test-key");
+      assert.deepEqual(saved.settings, next);
+      const persisted = await local.get("justTranslate.settings");
+      assert.equal(
+        (persisted["justTranslate.settings"] as typeof next).maxConcurrentRequests,
+        maxConcurrentRequests,
+      );
+      const restarted = new SettingsStore();
+      await restarted.initialize();
+      assert.deepEqual(restarted.view(), saved);
+    });
+  }
+}
+
+for (const rememberKey of [false, true]) {
+  test(`concurrency migration retains existing settings and credentials (remember=${rememberKey})`, async (t) => {
+    const { settings, local } = installStorage(t, rememberKey);
+    const { maxConcurrentRequests: _, ...legacy } = {
+      ...settings,
+      monthlyBudgetUsd: 12,
+      pageTokenLimit: 15000,
+      displayMode: "translation" as const,
+    };
+    await local.set({ "justTranslate.settings": legacy });
+    const store = new SettingsStore();
+    await store.initialize();
+    assert.deepEqual(store.view(), {
+      settings: { ...legacy, maxConcurrentRequests: 4 },
+      apiKey: "previous-test-key",
+      configured: true,
+    });
+  });
+}

@@ -41,7 +41,7 @@ async function eventually(check: () => boolean | Promise<boolean>, message: stri
   }
 }
 
-async function openFixture(t: TestContext, mode: Mode, body: string, held = false) {
+async function openFixture(t: TestContext, mode: Mode, body: string, held = false, maxConcurrentRequests?: number) {
   const profile = await mkdtemp(path.join(tmpdir(), "just-translate-content-"));
   const requests: string[][] = [];
   const apiErrors: string[] = [];
@@ -119,11 +119,17 @@ async function openFixture(t: TestContext, mode: Mode, body: string, held = fals
   await options.locator("#model").fill("content-stability-regression");
   await options.locator("#api-key").fill("local-content-fixture-key");
   await options.locator(`input[name="displayMode"][value="${mode}"]`).check();
+  if (maxConcurrentRequests !== undefined) {
+    await options.locator("#max-concurrent-requests").fill(String(maxConcurrentRequests));
+  }
   await options.locator("#test-connection").click();
   await options.locator("#test-connection:enabled").waitFor();
   const saved = await options.evaluate(() => chrome.runtime.sendMessage({ type: "settings:get" }));
   assert.equal(saved.value.configured, true);
   assert.equal(saved.value.settings.displayMode, mode);
+  if (maxConcurrentRequests !== undefined) {
+    assert.equal(saved.value.settings.maxConcurrentRequests, maxConcurrentRequests);
+  }
   const page = await context.newPage();
   await page.goto(`${base}/article`);
   const cdp = await context.newCDPSession(page);
@@ -299,7 +305,7 @@ for (const mode of ["bilingual", "translation"] as const) {
       "This queued card is detached before its request.",
     ];
     const replacement = "The website has replaced its pending paragraph.";
-    const fixture = await openFixture(t, mode, `<main>${sources.map((source, index) => `<article id="card${index}"><p>${source}</p></article>`).join("")}</main>`, true);
+    const fixture = await openFixture(t, mode, `<main>${sources.map((source, index) => `<article id="card${index}"><p>${source}</p></article>`).join("")}</main>`, true, 2);
     const { page } = fixture;
     await fixture.toggle();
     await eventually(() => fixture.requests.length === 2, "the two in-flight requests should occupy both content workers");

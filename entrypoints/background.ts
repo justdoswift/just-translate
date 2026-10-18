@@ -5,6 +5,7 @@ import {
   type PageMessage,
   type PageProgress,
   type Reply,
+  type Settings,
 } from "../src/shared";
 import { RequestError, errorDetail } from "../src/background/errors";
 import {
@@ -40,6 +41,11 @@ interface ToggleIntent {
 }
 const SESSIONS_KEY = "justTranslate.sessions";
 
+function configurationIdentity(settings: Settings): string {
+  const { maxConcurrentRequests: _concurrency, ...configuration } = settings;
+  return JSON.stringify(configuration);
+}
+
 export default defineBackground(() => {
   const settings = new SettingsStore();
   const state = new TranslationState();
@@ -55,6 +61,7 @@ export default defineBackground(() => {
   let configurationEpoch = 0;
   let restored = false;
   const ready = settings.initialize().then(async () => {
+    engine.setConcurrency(settings.view().settings.maxConcurrentRequests);
     await state.initialize(settings.view().settings);
     await restoreSessions();
     restored = true;
@@ -90,12 +97,24 @@ export default defineBackground(() => {
     return operation;
   }
 
+  async function notifyConcurrency(session: TranslationSession): Promise<void> {
+    await chrome.tabs.sendMessage(
+      session.tabId,
+      {
+        type: "page:concurrency",
+        sessionId: session.id,
+        maxConcurrentRequests: session.settings.maxConcurrentRequests,
+      } satisfies PageMessage,
+      { documentId: session.documentId },
+    );
+  }
+
   async function restoreSessions(): Promise<void> {
     const stored = await chrome.storage.session.get(SESSIONS_KEY);
     const records: unknown = stored[SESSIONS_KEY];
     const view = settings.view();
     const configurationId = await accountFingerprint(
-      JSON.stringify(view.settings),
+      configurationIdentity(view.settings),
     );
     let permitted = false;
     if (view.apiKey) {
@@ -160,6 +179,8 @@ export default defineBackground(() => {
             sessions.set(record.tabId, session);
             documents.set(record.tabId, record.documentId);
             configurationIds.set(record.id, configurationId);
+            // A worker may have stopped after saving a new limit but before notifying this page.
+            await notifyConcurrency(session).catch(() => undefined);
           } catch {
             /* Closed, replaced, or inactive documents are deliberately not restored. */
           }
@@ -340,6 +361,7 @@ export default defineBackground(() => {
       return;
     }
     const view = settings.view();
+    const fingerprint = settings.fingerprint;
     validateKey(view.apiKey);
     await requireApiPermission(view.settings);
     if (!current()) return;
@@ -359,16 +381,20 @@ export default defineBackground(() => {
     if (!documentId)
       throw new RequestError("stale", "页面或设置已变化，请再次使用翻译快捷键。");
     const configurationId = await accountFingerprint(
-      JSON.stringify(view.settings),
+      configurationIdentity(view.settings),
     );
     if (!current()) return;
     const session: TranslationSession = {
       id: crypto.randomUUID(),
       tabId,
       documentId,
-      settings: view.settings,
+      // Keep provider credentials and cache identity in one captured snapshot.
+      settings: {
+        ...view.settings,
+        maxConcurrentRequests: settings.view().settings.maxConcurrentRequests,
+      },
       apiKey: view.apiKey,
-      fingerprint: settings.fingerprint,
+      fingerprint,
       controller: new AbortController(),
       requests: new Set(),
       persist: persistSessions,
@@ -379,6 +405,7 @@ export default defineBackground(() => {
     try {
       await persistSessions();
       if (!current() || sessions.get(tabId) !== session) return;
+      const maxConcurrentRequests = session.settings.maxConcurrentRequests;
       const reply = (await chrome.tabs.sendMessage(
         tabId,
         {
@@ -386,6 +413,7 @@ export default defineBackground(() => {
           sessionId: session.id,
           targetLanguage: view.settings.targetLanguage,
           displayMode: view.settings.displayMode,
+          maxConcurrentRequests,
         } satisfies PageMessage,
         { documentId },
       )) as Reply<PageSnapshot>;
@@ -396,6 +424,8 @@ export default defineBackground(() => {
           "页面翻译脚本未能启动；请刷新页面后重试。",
           true,
         );
+      if (maxConcurrentRequests !== session.settings.maxConcurrentRequests)
+        await notifyConcurrency(session).catch(() => undefined);
       await badge(tabId, "running");
       if (!current() || sessions.get(tabId) !== session) return;
       await chrome.storage.session.remove(STARTUP_ERROR_KEY);
@@ -414,6 +444,16 @@ export default defineBackground(() => {
     if (message.type === "page:translate") {
       const session = liveSession(sender, message.sessionId);
       const result = await engine.translate(
+        session,
+        message.requestId,
+        message.segments,
+      );
+      liveSession(sender, message.sessionId);
+      return result;
+    }
+    if (message.type === "page:cached") {
+      const session = liveSession(sender, message.sessionId);
+      const result = await engine.cached(
         session,
         message.requestId,
         message.segments,
@@ -473,18 +513,39 @@ export default defineBackground(() => {
       const key = validateKey(message.apiKey);
       const operation = configuration.then(async () => {
         await requireApiPermission(next);
+        const previous = settings.view();
+        const sameConfiguration = previous.apiKey === key &&
+          configurationIdentity(previous.settings) === configurationIdentity(next);
         const result = await settings.save(next, key);
+        // No observable session/dispatch changes precede the durable settings commit.
+        if (sameConfiguration) {
+          engine.setConcurrency(next.maxConcurrentRequests);
+          for (const session of sessions.values()) session.settings = next;
+          if (previous.settings.maxConcurrentRequests === next.maxConcurrentRequests)
+            return result;
+          const notifications = await Promise.allSettled(
+            [...sessions.values()].map((session) => notifyConcurrency(session)),
+          );
+          return notifications.some((outcome) => outcome.status === "rejected")
+            ? { ...result, warning: "配置已保存，但部分页面未收到并发设置；后台并发限制已生效。" }
+            : result;
+        }
         configurationEpoch++;
         intents.clear();
         engine.cancelTests();
+        const stopped = [...sessions.keys()].map((tabId) =>
+          stop(tabId, "设置已更改，请重新开始翻译。"),
+        );
+        engine.setConcurrency(next.maxConcurrentRequests);
+        if (previous.apiKey !== key ||
+          previous.settings.provider !== next.provider ||
+          previous.settings.baseUrl !== next.baseUrl ||
+          previous.settings.model !== next.model)
+          engine.resetThrottle();
         // Persistence above is the commit. Cleanup failures must remain visible
         // without claiming that the now-active configuration was rolled back.
         const cleanup = await Promise.allSettled([
-          Promise.allSettled(
-            [...sessions.keys()].map((tabId) =>
-              stop(tabId, "设置已更改，请重新开始翻译。"),
-            ),
-          ).then((outcomes) => {
+          Promise.allSettled(stopped).then((outcomes) => {
             for (const outcome of outcomes)
               if (outcome.status === "rejected") throw outcome.reason;
           }),
@@ -510,7 +571,23 @@ export default defineBackground(() => {
       return engine.test(next, key);
     }
     if (message.type === "usage:get") return state.usage();
-    if (message.type === "cache:clear") return state.clearCache();
+    if (message.type === "cache:clear") {
+      const result = await state.clearCache();
+      const notifications = await Promise.allSettled(
+        [...sessions.values()].map((session) =>
+          chrome.tabs.sendMessage(
+            session.tabId,
+            { type: "page:cache-cleared", sessionId: session.id } satisfies PageMessage,
+            { documentId: session.documentId },
+          ),
+        ),
+      );
+      if (notifications.some((outcome) => outcome.status === "rejected"))
+        throw new RequestError(
+          "internal", "缓存已清除，但部分页面未收到通知，请停止后重新开启翻译。",
+        );
+      return result;
+    }
     throw new RequestError("unsupported", "不支持的扩展消息。");
   }
 

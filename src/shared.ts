@@ -1,9 +1,10 @@
-export const APP_VERSION = "0.2.5";
+export const APP_VERSION = "0.2.6";
 export const STARTUP_ERROR_KEY = "justTranslate.startupError";
 export const PROMPT_VERSION = "3";
 export const MAX_BATCH_SEGMENTS = 8;
 export const MAX_BATCH_CHARS = 5500;
 export const MAX_SEGMENT_CHARS = 2400;
+export const MAX_CONCURRENT_REQUESTS = 8;
 export const LANGUAGES = [
   { value: "zh-CN", label: "简体中文" },
   { value: "zh-TW", label: "繁體中文" },
@@ -23,6 +24,7 @@ export interface Settings {
   model: string;
   targetLanguage: string;
   displayMode: DisplayMode;
+  maxConcurrentRequests: number;
   jsonMode: boolean;
   disableThinking: boolean;
   rememberKey: boolean;
@@ -40,6 +42,7 @@ export const DEFAULT_SETTINGS: Settings = {
   model: "deepseek-flash",
   targetLanguage: "zh-CN",
   displayMode: "bilingual",
+  maxConcurrentRequests: 4,
   jsonMode: true,
   disableThinking: true,
   rememberKey: false,
@@ -130,7 +133,7 @@ export type BackgroundMessage =
   | { type: "usage:get" }
   | { type: "cache:clear" }
   | {
-      type: "page:translate";
+      type: "page:translate" | "page:cached";
       sessionId: string;
       requestId: string;
       segments: Segment[];
@@ -145,7 +148,10 @@ export type PageMessage =
       sessionId: string;
       targetLanguage: string;
       displayMode: DisplayMode;
+      maxConcurrentRequests: number;
     }
+  | { type: "page:concurrency"; sessionId: string; maxConcurrentRequests: number }
+  | { type: "page:cache-cleared"; sessionId: string }
   | { type: "page:stop"; sessionId?: string; reason?: string }
   | { type: "page:ping" };
 

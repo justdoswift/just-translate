@@ -24,6 +24,12 @@ interface Context {
   right: number;
 }
 
+// Carry only subpixel correction debt, never an old reading position.
+const roundingRemainders = new WeakMap<
+  Element,
+  { anchor: Element; scrollTop: number; offset: number; delta: number }
+>();
+
 /** A snapshot lasts only for this synchronous DOM batch, never across a request. */
 export function preserveReadingPosition(
   elements: Iterable<Element>,
@@ -171,6 +177,10 @@ export function preserveReadingPosition(
     // Inner scrollports settle first, so their correction is not repeated on the document.
     for (const port of [...ports.values()].sort((a, b) => b.depth - a.depth)) {
       if (!port.element.isConnected) continue;
+      const remainder = roundingRemainders.get(port.element);
+      roundingRemainders.delete(port.element);
+      let anchorOffset: number | undefined;
+      const scrollBefore = port.element.scrollTop;
       let target: number;
       if (port.scrollTop === 0) {
         target = 0;
@@ -186,6 +196,13 @@ export function preserveReadingPosition(
           Number.parseFloat(getComputedStyle(port.anchor).lineHeight) || 1;
         const offset = Math.max(port.offset, -Math.max(0, rect.height - line));
         target = port.element.scrollTop + rect.top - top - port.inset - offset;
+        anchorOffset = rect.top - top - port.inset;
+        if (
+          remainder?.anchor === port.anchor &&
+          remainder.scrollTop === port.scrollTop &&
+          Math.abs(remainder.offset - port.offset) < 1 / 64
+        )
+          target += remainder.delta;
       } else {
         continue;
       }
@@ -197,6 +214,14 @@ export function preserveReadingPosition(
           top: target,
           left: port.scrollLeft,
           behavior: "instant",
+        });
+      const delta = target - port.element.scrollTop;
+      if (port.anchor && anchorOffset !== undefined && delta && Math.abs(delta) < 1)
+        roundingRemainders.set(port.element, {
+          anchor: port.anchor,
+          scrollTop: port.element.scrollTop,
+          offset: anchorOffset - (port.element.scrollTop - scrollBefore),
+          delta,
         });
     }
   }
