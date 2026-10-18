@@ -48,6 +48,7 @@ async function openFixture(t: TestContext, mode: Mode, body: string, held = fals
   const pending = new Set<() => void>();
   let context: BrowserContext | undefined;
   let rejectPageRequests = false;
+  let completedResponses = 0;
   const release = () => {
     held = false;
     for (const resolve of pending) resolve();
@@ -68,6 +69,7 @@ async function openFixture(t: TestContext, mode: Mode, body: string, held = fals
       const connection = input.items.length === 1 && input.items[0]!.text === connectionText;
       if (!connection) {
         requests.push(input.items.map((item) => item.text));
+        response.once("finish", () => { completedResponses++; });
         if (held) await new Promise<void>((resolve) => pending.add(resolve));
         if (rejectPageRequests) {
           response.writeHead(400, { "Content-Type": "application/json" });
@@ -161,6 +163,9 @@ async function openFixture(t: TestContext, mode: Mode, body: string, held = fals
           expected,
           actual,
           requests,
+          held,
+          pendingResponses: pending.size,
+          completedResponses,
           hosts: await page.locator(hostSelector).evaluateAll((nodes) =>
             nodes.map((node) => ({ busy: node.getAttribute("aria-busy"), text: node.textContent }))),
           sessions: await worker.evaluate(() => chrome.storage.session.get("justTranslate.sessions")),
