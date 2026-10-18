@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test, { afterEach, beforeEach, type TestContext } from "node:test";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { DEFAULT_SETTINGS, type BatchResult, type Segment } from "../src/shared";
 import { TranslationEngine, type TranslationSession } from "../src/background/engine";
 import { RequestError } from "../src/background/errors";
@@ -66,20 +67,24 @@ interface WireRequest {
   context: string[];
   signal: AbortSignal;
   respond: (texts: string[]) => void;
+  rateLimit: (retryAfter: string, body?: ReadableStream<Uint8Array>) => void;
   fail: () => void;
 }
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, concurrency?: number) {
   const state = new TranslationState();
   await state.initialize(DEFAULT_SETTINGS);
   const engine = new TranslationEngine(state);
+  if (concurrency !== undefined) engine.setConcurrency(concurrency);
   const calls: WireRequest[] = [];
   const sessions: TranslationSession[] = [];
-  const pending: Promise<BatchResult>[] = [];
+  const pending: Promise<BatchResult | null>[] = [];
   const callWaiters = new Map<number, Deferred<void>>();
   const lookupWaiters = new Map<number, Deferred<void>>();
   let automaticResponse: ((call: WireRequest) => void) | undefined;
   let lookups = 0;
+  let activeCalls = 0;
+  let peakCalls = 0;
   const lookup = state.lookup.bind(state);
   const lookupMock = t.mock.method(state, "lookup", async (keys: string[]) => {
     const result = await lookup(keys);
@@ -88,6 +93,8 @@ async function fixture(t: TestContext) {
     return result;
   });
   const fetchMock = t.mock.method(globalThis, "fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+    activeCalls++;
+    peakCalls = Math.max(peakCalls, activeCalls);
     assert.ok(init);
     assert.equal(typeof init?.body, "string");
     const body = JSON.parse(init.body as string);
@@ -122,6 +129,11 @@ async function fixture(t: TestContext) {
           usage: { prompt_tokens: 120, completion_tokens: 80 },
         }), { status: 200 }));
       },
+      rateLimit(retryAfter, body) {
+        response.resolve(new Response(body ?? "{}", {
+          status: 429, headers: { "Retry-After": retryAfter },
+        }));
+      },
       fail() {
         response.resolve(new Response(JSON.stringify({
           choices: [{ message: { content: '{"items":[]}' }, finish_reason: "stop" }],
@@ -136,6 +148,7 @@ async function fixture(t: TestContext) {
     try {
       return await response.promise;
     } finally {
+      activeCalls--;
       signal.removeEventListener("abort", abort);
     }
   });
@@ -147,6 +160,8 @@ async function fixture(t: TestContext) {
   });
   return {
     state,
+    engine,
+    get peakCalls() { return peakCalls; },
     calls,
     respondAll(texts: string[]) {
       automaticResponse = (call) => call.respond(texts);
@@ -179,6 +194,21 @@ async function fixture(t: TestContext) {
       pending.push(result);
       void result.catch(() => undefined);
       return result;
+    },
+    cached(session: TranslationSession, id: string, segments: Segment[]) {
+      const result = engine.cached(session, id, segments);
+      pending.push(result);
+      void result.catch(() => undefined);
+      return result;
+    },
+    async lookedUp(count: number) {
+      if (lookups < count) {
+        const gate = deferred<void>();
+        lookupWaiters.set(count, gate);
+        await gate.promise;
+      }
+      // Let the engine consume the completed lookup and enqueue before asserting no dispatch.
+      await nextTurn();
     },
     async called(count: number) {
       if (calls.length >= count) return;
@@ -232,7 +262,7 @@ for (const batch of [false, true]) {
 }
 
 test("a completed cache hit resolves while both global network slots remain held", { timeout: 5000 }, async (t) => {
-  const f = await fixture(t);
+  const f = await fixture(t, 2);
   const page = f.session();
   const prime = f.translate(page, "prime", [segment("prime")]);
   await f.called(1);
@@ -270,7 +300,7 @@ for (const persistentCache of [false, true]) {
       text: "其他缓存译文",
     })), generation);
     now += 1000;
-    await f.translate(page, "reuse", [segment("copy")]);
+    await f.cached(page, "reuse", [segment("copy")]);
 
     const recovered = new TranslationState();
     await recovered.initialize(settings);
@@ -477,4 +507,335 @@ test("clearing cache while pending separates generations and prevents stale cach
   assert.equal(usage.requests, 2);
   assert.equal(usage.inputTokens, 240);
   assert.equal(usage.outputTokens, 160);
+});
+
+for (const limit of [1, 4, 8]) {
+  test(`real provider calls share a global cap of ${limit} across page sessions`, { timeout: 5000 }, async (t) => {
+    // Leave four unconfigured to exercise the actual default, not a fixture override.
+    const f = await fixture(t, limit === 4 ? undefined : limit);
+    const jobs = Array.from({ length: limit + 2 }, (_, index) =>
+      f.translate(f.session(), `request-${index}`, [segment(`item-${index}`, `Unique source ${index}`)]));
+    await f.called(limit);
+    await f.lookedUp(limit * 2 + 2);
+    assert.equal(f.calls.length, limit);
+    assert.equal(f.peakCalls, limit);
+    f.respondAll(["译文"]);
+    await Promise.all(jobs);
+    assert.equal(f.calls.length, limit + 2);
+    assert.equal(f.peakCalls, limit);
+    assert.equal((await f.state.usage()).usage.requests, limit + 2);
+  });
+}
+
+test("raising pumps held work and lowering drains without aborting dispatched calls", { timeout: 5000 }, async (t) => {
+  const f = await fixture(t, 1);
+  const page = f.session();
+  const jobs = Array.from({ length: 8 }, (_, index) =>
+    f.translate(page, `request-${index}`, [segment(`item-${index}`, `Unique source ${index}`)]));
+  await f.called(1);
+  await f.lookedUp(9);
+  f.engine.setConcurrency(4);
+  await f.called(4);
+  f.engine.setConcurrency(1);
+  for (const invalid of [0, 9, 1.5, Number.NaN, Number.POSITIVE_INFINITY])
+    assert.throws(() => f.engine.setConcurrency(invalid), RequestError);
+  assert.ok(f.calls.every((call) => !call.signal.aborted));
+  for (const call of f.calls.slice(0, 3)) call.respond(["译文"]);
+  await nextTurn();
+  assert.equal(f.calls.length, 4, "lowering waits until all excess active work drains");
+  f.calls[3]!.respond(["译文"]);
+  await f.called(5);
+  f.engine.setConcurrency(8);
+  await f.called(8);
+  assert.ok(f.calls.every((call) => !call.signal.aborted));
+  f.respondAll(["译文"]);
+  await Promise.all(jobs);
+  assert.equal((await f.state.usage()).usage.uncertainRequests, 0);
+});
+
+test("a page can queue eight behind busy pages and round-robin still serves another page", { timeout: 5000 }, async (t) => {
+  const f = await fixture(t, 8);
+  const busy = f.session();
+  const waiting = f.session();
+  const neighbor = f.session();
+  const held = Array.from({ length: 8 }, (_, index) =>
+    f.translate(busy, `held-${index}`, [segment(`held-${index}`, `Held source ${index}`)]));
+  await f.called(8);
+  const queued = Array.from({ length: 8 }, (_, index) =>
+    f.translate(waiting, `queued-${index}`, [segment(`queued-${index}`, `Queued source ${index}`)]));
+  await f.lookedUp(24);
+  await assert.rejects(
+    f.translate(waiting, "overflow", [segment("overflow", "Overflow source")]),
+    (error: unknown) => error instanceof RequestError && error.detail.code === "rate_limit",
+  );
+  const other = f.translate(neighbor, "neighbor", [segment("neighbor", "Neighbor source")]);
+  await f.lookedUp(26);
+  assert.equal(f.calls.length, 8);
+  f.calls[0]!.respond(["译文"]);
+  await f.called(9);
+  assert.match(f.calls[8]!.items[0]!.id, /^queued-/);
+  f.calls[1]!.respond(["译文"]);
+  await f.called(10);
+  assert.equal(f.calls[9]!.items[0]!.id, "neighbor");
+  f.respondAll(["译文"]);
+  await Promise.all([...held, ...queued, other]);
+  assert.equal(f.calls.length, 17);
+  assert.equal(f.peakCalls, 8);
+});
+
+test("cache-only misses never wait on flights, spend request IDs or reserve usage", { timeout: 5000 }, async (t) => {
+  const f = await fixture(t, 1);
+  let persisted = 0;
+  const page = f.session({ persist: async () => { persisted++; } });
+  for (let index = 0; index < 3; index++)
+    assert.equal(await f.cached(page, "probe", [segment("missing")]), null);
+  assert.equal(page.requests.size, 0);
+  assert.equal(persisted, 0);
+  assert.equal(f.calls.length, 0);
+  assert.equal((await f.state.usage()).usage.requests, 0);
+  // Even an exhausted request-ID budget cannot turn a cache miss into billable work.
+  for (let index = 0; index < 20_000; index++) page.requests.add(`old-${index}`);
+  assert.equal(await f.cached(page, "probe", [segment("missing")]), null);
+  assert.equal(page.requests.size, 20_000);
+  page.requests.clear();
+  const original = f.translate(page, "probe", [segment("original")]);
+  await f.called(1);
+  assert.equal(await f.cached(page, "pending-copy", [segment("copy")]), null);
+  assert.equal(page.requests.has("pending-copy"), false);
+  assert.equal(f.calls.length, 1);
+  f.calls[0]!.respond(["订阅"]);
+  await original;
+  const reused = await f.cached(page, "pending-copy", [segment("copy", "Subscribe", "", 8)]);
+  assert.deepEqual(reused?.translations, [{ id: "copy", revision: 8, text: "订阅", cached: true }]);
+  assert.equal(persisted, 2);
+  assert.equal(page.requests.size, 2);
+  assert.equal((await f.state.usage()).usage.requests, 1);
+});
+
+test("cache-only full hits bypass all occupied slots while exact ordered account/context identity is preserved", { timeout: 5000 }, async (t) => {
+  const f = await fixture(t);
+  const page = f.session();
+  const sources = [segment("first", "The bank is nearby.", "Finance"), segment("second", "Deposit money.", "Finance")];
+  const prime = f.translate(page, "prime", sources);
+  await f.called(1);
+  f.calls[0]!.respond(["银行就在附近。", "存钱。"]);
+  await prime;
+  const held = Array.from({ length: 4 }, (_, index) =>
+    f.translate(f.session(), `held-${index}`, [segment(`held-${index}`, `Held source ${index}`)]));
+  await f.called(5);
+  const copies = sources.map((item) => ({ ...item, id: `copy-${item.id}`, revision: 9 }));
+  const hit = await f.cached(page, "cached", copies);
+  assert.deepEqual(hit, {
+    translations: [
+      { id: "copy-first", revision: 9, text: "银行就在附近。", cached: true },
+      { id: "copy-second", revision: 9, text: "存钱。", cached: true },
+    ],
+    inputTokens: 0, outputTokens: 0, estimated: false,
+  });
+  assert.equal(await f.cached(page, "miss", [...copies].reverse()), null);
+  assert.equal(await f.cached(page, "miss", copies.map((item) => ({ ...item, context: "River" }))), null);
+  assert.equal(await f.cached(page, "miss", [copies[0]!]), null);
+  assert.equal(await f.cached(f.session({ fingerprint: "other-account" }), "miss", copies), null);
+  page.settings = { ...page.settings, maxConcurrentRequests: 8 };
+  assert.ok(await f.cached(page, "new-limit", copies), "concurrency is not part of cache identity");
+  assert.equal(f.calls.length, 5);
+  assert.equal((await f.state.usage()).usage.inputTokens, 120);
+  for (const call of f.calls.slice(1)) call.respond(["译文"]);
+  await Promise.all(held);
+});
+
+test("429 Retry-After cools all queued dispatch then recovers concurrency one slot at a time", { timeout: 5000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.UTC(2026, 0, 1) });
+  const f = await fixture(t);
+  const busy = f.session();
+  const waiting = f.session();
+  const held = Array.from({ length: 4 }, (_, index) =>
+    f.translate(busy, `held-${index}`, [segment(`held-${index}`, `Held source ${index}`)]));
+  await f.called(4);
+  const queued = Array.from({ length: 8 }, (_, index) =>
+    f.translate(waiting, `queued-${index}`, [segment(`queued-${index}`, `Queued source ${index}`)]));
+  await f.lookedUp(16);
+  f.calls[0]!.rateLimit("2");
+  for (const call of f.calls.slice(1, 4)) call.respond(["译文"]);
+  await nextTurn();
+  assert.equal(f.calls.length, 4);
+  t.mock.timers.tick(1999);
+  await nextTurn();
+  assert.equal(f.calls.length, 4);
+  t.mock.timers.tick(1);
+  await f.called(6);
+  await nextTurn();
+  assert.equal(f.calls.length, 6, "one bounded retry plus one new call fill the reduced cap of two");
+  for (const call of f.calls.slice(4, 6)) call.respond(["译文"]);
+  await f.called(9);
+  await nextTurn();
+  assert.equal(f.calls.length, 9, "two successes recover only one slot");
+  for (const call of f.calls.slice(6, 9)) call.respond(["译文"]);
+  await f.called(13);
+  assert.equal(f.calls.length, 13, "three more successes restore the configured cap of four");
+  f.respondAll(["译文"]);
+  await Promise.all([...held, ...queued]);
+  assert.equal((await f.state.usage()).usage.requests, 13);
+  assert.equal((await f.state.usage()).usage.inputTokens, 12 * 120);
+  assert.equal((await f.state.usage()).usage.uncertainRequests, 0);
+});
+
+test("long provider cooldown keeps unsent queue deadlines and cancellation cannot revive work", { timeout: 5000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.UTC(2026, 0, 1) });
+  const f = await fixture(t, 1);
+  const busy = f.session();
+  const waiting = f.session();
+  const cancelled = f.session();
+  const first = f.translate(busy, "limited", [segment("limited", "Limited source")]);
+  await f.called(1);
+  const queued = f.translate(waiting, "expires", [segment("expires", "Queued source")]);
+  const stopped = f.translate(cancelled, "stopped", [segment("stopped", "Cancelled source")]);
+  await f.lookedUp(4);
+  f.calls[0]!.rateLimit("60");
+  await assert.rejects(first, (error: unknown) => error instanceof RequestError &&
+    error.detail.code === "rate_limit" && !error.detail.uncertain);
+  cancelled.controller.abort();
+  await assert.rejects(stopped, (error: unknown) => error instanceof RequestError &&
+    error.detail.code === "cancelled");
+  t.mock.timers.tick(30_000);
+  await assert.rejects(queued, (error: unknown) => error instanceof RequestError &&
+    error.detail.code === "rate_limit" && /尚未发送/.test(error.detail.message) &&
+    !error.dispatched && !error.detail.uncertain);
+  t.mock.timers.tick(60_000);
+  await nextTurn();
+  assert.equal(f.calls.length, 1);
+  assert.equal((await f.state.usage()).usage.requests, 1);
+  assert.equal((await f.state.usage()).usage.inputTokens, 0);
+});
+
+test("held 429 retries obey a lowered cap instead of borrowing logical job slots", { timeout: 5000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.UTC(2026, 0, 1) });
+  const f = await fixture(t);
+  const page = f.session();
+  const jobs = Array.from({ length: 4 }, (_, index) =>
+    f.translate(page, `limited-${index}`, [segment(`limited-${index}`, `Limited source ${index}`)]));
+  await f.called(4);
+  for (const call of f.calls) call.rateLimit("2");
+  await nextTurn();
+  f.engine.setConcurrency(1);
+  t.mock.timers.tick(2000);
+  for (let count = 5; count <= 8; count++) {
+    await f.called(count);
+    await nextTurn();
+    assert.equal(f.calls.length, count, "only one new HTTP attempt may be active");
+    f.calls[count - 1]!.respond(["译文"]);
+  }
+  await Promise.all(jobs);
+  assert.equal(f.calls.length, 8, "each request retries at most once");
+  assert.equal((await f.state.usage()).usage.inputTokens, 4 * 120);
+  assert.equal((await f.state.usage()).usage.uncertainRequests, 0);
+});
+
+test("a later Retry-After extends the cooldown for retries already waiting to resume", { timeout: 5000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.UTC(2026, 0, 1) });
+  const f = await fixture(t, 2);
+  const jobs = [
+    f.translate(f.session(), "short", [segment("short", "Short backoff")]),
+    f.translate(f.session(), "long", [segment("long", "Longer backoff")]),
+  ];
+  await f.called(2);
+  f.calls[0]!.rateLimit("1");
+  await nextTurn();
+  t.mock.timers.tick(500);
+  f.calls[1]!.rateLimit("3");
+  await nextTurn();
+  t.mock.timers.tick(500);
+  await nextTurn();
+  assert.equal(f.calls.length, 2, "the first private retry timer cannot bypass shared cooldown");
+  t.mock.timers.tick(2499);
+  await nextTurn();
+  assert.equal(f.calls.length, 2);
+  t.mock.timers.tick(1);
+  await f.called(3);
+  await nextTurn();
+  assert.equal(f.calls.length, 3);
+  f.calls[2]!.respond(["译文"]);
+  await f.called(4);
+  f.calls[3]!.respond(["译文"]);
+  await Promise.all(jobs);
+  assert.equal((await f.state.usage()).usage.requests, 4);
+});
+
+test("aborting a retry admission waiter removes it without dispatch or an uncertain charge", { timeout: 5000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.UTC(2026, 0, 1) });
+  const f = await fixture(t, 2);
+  const firstPage = f.session();
+  const secondPage = f.session();
+  const first = f.translate(firstPage, "first", [segment("first", "First source")]);
+  await f.called(1);
+  const second = f.translate(secondPage, "second", [segment("second", "Second source")]);
+  await f.called(2);
+  f.calls[0]!.rateLimit("1");
+  await nextTurn();
+  f.calls[1]!.rateLimit("2");
+  await nextTurn();
+  t.mock.timers.tick(1000);
+  await nextTurn();
+  assert.equal(f.calls.length, 2);
+  firstPage.controller.abort();
+  await assert.rejects(first, (error: unknown) => error instanceof RequestError &&
+    error.detail.code === "cancelled" && !error.detail.uncertain);
+  t.mock.timers.tick(1000);
+  await f.called(3);
+  assert.equal(f.calls[2]!.items[0]!.id, "second");
+  f.calls[2]!.respond(["译文"]);
+  await second;
+  t.mock.timers.tick(30_000);
+  await nextTurn();
+  assert.equal(f.calls.length, 3);
+  assert.equal((await f.state.usage()).usage.uncertainRequests, 0);
+});
+
+test("resetting provider throttle after cancellation clears old cooldown and ignores late old responses", { timeout: 5000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.UTC(2026, 0, 1) });
+  const f = await fixture(t);
+  const old = f.session();
+  const limited = f.translate(old, "limited", [segment("limited", "Old source")]);
+  await f.called(1);
+  const late = f.translate(old, "late", [segment("late", "Late old response")]);
+  await f.called(2);
+  f.calls[0]!.rateLimit("120");
+  await assert.rejects(limited, (error: unknown) => error instanceof RequestError &&
+    error.detail.code === "rate_limit");
+  let finishBody!: () => void;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      finishBody = () => {
+        controller.enqueue(new TextEncoder().encode("{}"));
+        controller.close();
+      };
+    },
+  });
+  f.calls[1]!.rateLimit("300", body);
+  await nextTurn();
+  old.controller.abort();
+  f.engine.setConcurrency(4);
+  f.engine.resetThrottle();
+  const fresh = f.session({
+    apiKey: "fixture-new-account",
+    fingerprint: "fixture-new-account-fingerprint",
+    settings: { ...DEFAULT_SETTINGS, baseUrl: "https://fresh-provider.example", pageTokenLimit: 0 },
+  });
+  const jobs = Array.from({ length: 4 }, (_, index) =>
+    f.translate(fresh, `fresh-${index}`, [segment(`fresh-${index}`, `Fresh source ${index}`)]));
+  await f.called(5);
+  finishBody();
+  await assert.rejects(late, (error: unknown) => error instanceof RequestError &&
+    error.detail.code === "cancelled" && !error.detail.uncertain);
+  await f.called(6);
+  for (const call of f.calls.slice(2)) {
+    assert.equal(call.url, "https://fresh-provider.example/chat/completions");
+    assert.equal(call.authorization, "Bearer fixture-new-account");
+    call.respond(["译文"]);
+  }
+  await Promise.all(jobs);
+  t.mock.timers.tick(300_000);
+  await nextTurn();
+  assert.equal(f.calls.length, 6);
+  assert.equal((await f.state.usage()).usage.inputTokens, 4 * 120);
 });

@@ -2,6 +2,7 @@ import {
   LANGUAGES,
   MAX_BATCH_CHARS,
   MAX_BATCH_SEGMENTS,
+  MAX_CONCURRENT_REQUESTS,
   sendMessage,
   type AppError,
   type BatchResult,
@@ -34,10 +35,16 @@ interface Task {
   text?: string;
   error?: AppError;
   manual: boolean;
+  cacheChecked: boolean;
 }
 interface TaskBatch {
   tasks: Task[];
   shared: boolean;
+}
+interface PendingBatch {
+  key: string;
+  segments: Segment[];
+  batches: TaskBatch[];
 }
 interface Block {
   id: string;
@@ -88,7 +95,9 @@ class PageSession {
   private running = true;
   private readonly blocks = new Map<Element, Block>();
   private readonly queue = new Set<Task>();
+  private readonly cacheQueue = new Set<Task>();
   private readonly tasksByText = new Map<string, Set<Task>>();
+  private readonly pendingBatches = new Map<string, PendingBatch>();
   private readonly owned = new WeakSet<Node>();
   private readonly viewOwners = new WeakMap<Node, Block>();
   private readonly dirty = new Map<
@@ -96,7 +105,7 @@ class PageSession {
     { due: number; subtree: boolean }
   >();
   private readonly waitingRequests = new Set<
-    (reply: Reply<BatchResult>) => void
+    (reply: Reply<BatchResult | null>) => void
   >();
   private readonly observer: MutationObserver;
   private readonly intersection: IntersectionObserver;
@@ -105,6 +114,9 @@ class PageSession {
   private progressTimer?: number;
   private pumpTimer?: number;
   private inflight = 0;
+  private cacheInflight = 0;
+  private cacheGeneration = 0;
+  private firstProseBatch = true;
   private visibleTurns = 0;
   private blocked?: AppError;
   private lastProgress = "";
@@ -113,6 +125,7 @@ class PageSession {
     readonly id: string,
     private readonly language: string,
     private readonly displayMode: Settings["displayMode"],
+    private maxConcurrentRequests: number,
     private readonly ended: (session: PageSession) => void,
     private readonly isContextValid: () => boolean,
   ) {
@@ -155,6 +168,15 @@ class PageSession {
     };
   }
 
+  setConcurrency(limit: number): void {
+    this.maxConcurrentRequests = limit;
+    this.schedulePump();
+  }
+
+  clearCacheReuse(): void {
+    this.cacheGeneration += 1;
+  }
+
   stop(reason: string, notify = true): void {
     if (!this.running) return;
     for (const record of this.observer.takeRecords()) consumeSourceMutation(record);
@@ -177,7 +199,9 @@ class PageSession {
     });
     this.blocks.clear();
     this.queue.clear();
+    this.cacheQueue.clear();
     this.tasksByText.clear();
+    this.pendingBatches.clear();
     this.dirty.clear();
     if (notify && this.isContextValid()) {
       void sendMessage<void>({
@@ -401,11 +425,12 @@ class PageSession {
         state: this.blocked ? "failed" : "queued",
         error: this.blocked,
         manual: false,
+        cacheChecked: false,
       };
     });
     for (const task of oldTasks) {
       this.unindex(task);
-      if (!block.tasks.includes(task)) this.queue.delete(task);
+      if (!block.tasks.includes(task)) this.dequeue(task);
     }
     this.blocks.set(element, block);
     if (!previous) this.intersection.observe(element);
@@ -413,9 +438,19 @@ class PageSession {
       let copies = this.tasksByText.get(task.segment.text);
       if (!copies) this.tasksByText.set(task.segment.text, (copies = new Set()));
       copies.add(task);
-      if (task.state === "queued") this.queue.add(task);
+      if (task.state === "queued") this.enqueue(task);
     }
     this.render(block);
+  }
+
+  private enqueue(task: Task): void {
+    this.queue.add(task);
+    if (!task.cacheChecked) this.cacheQueue.add(task);
+  }
+
+  private dequeue(task: Task): void {
+    this.queue.delete(task);
+    this.cacheQueue.delete(task);
   }
 
   private unindex(task: Task): void {
@@ -426,7 +461,7 @@ class PageSession {
 
   private release(block: Block): void {
     for (const task of block.tasks) {
-      this.queue.delete(task);
+      this.dequeue(task);
       this.unindex(task);
     }
     block.view?.remove();
@@ -453,29 +488,41 @@ class PageSession {
     }, 0);
   }
 
-  private nextTask(): Task | undefined {
+  private nextTask(cacheOnly = false): Task | undefined {
     let oldest: Task | undefined;
     let visible: Task | undefined;
-    for (const task of this.queue) {
+    let nearby: Task | undefined;
+    for (const task of cacheOnly ? this.cacheQueue : this.queue) {
       if (!this.current(task)) {
-        this.queue.delete(task);
+        this.dequeue(task);
         continue;
       }
-      if (task.block.dirty || (this.blocked && !task.manual)) continue;
+      if (
+        task.block.dirty ||
+        (this.blocked && !task.manual) ||
+        (cacheOnly && task.cacheChecked)
+      )
+        continue;
       oldest ??= task;
       if (task.block.visible) {
-        visible = task;
-        break;
+        nearby ??= task;
+        const rect = task.block.element.getBoundingClientRect();
+        if (rect.bottom > 0 && rect.top < innerHeight) {
+          visible = task;
+          break;
+        }
       }
     }
-    // Every fourth choice is FIFO, so offscreen loaded content cannot starve.
-    if (oldest && (this.visibleTurns >= 3 || !visible)) {
+    const preferred = visible ?? nearby;
+    if (cacheOnly) return preferred ?? oldest;
+    // Keep eventual whole-page progress without letting near-screen prefetch beat visible text.
+    if (oldest && (this.visibleTurns >= 3 || !preferred)) {
       this.visibleTurns = 0;
       return oldest;
     }
-    if (visible) {
+    if (preferred) {
       this.visibleTurns += 1;
-      return visible;
+      return preferred;
     }
     return oldest;
   }
@@ -496,7 +543,7 @@ class PageSession {
       .flatMap((element) => this.blocks.get(element)?.tasks ?? []);
   }
 
-  private batch(seed: Task): TaskBatch {
+  private batch(seed: Task, cacheOnly = false): TaskBatch {
     const isolated = (task: Task): boolean =>
       task.block.tasks.length === 1 &&
       isIsolatedElement(task.block.element, this.isOwned);
@@ -508,6 +555,7 @@ class PageSession {
           copy !== seed &&
           this.queue.has(copy) &&
           this.current(copy) &&
+          (!cacheOnly || !copy.cacheChecked) &&
           !copy.block.dirty &&
           (!this.blocked || copy.manual) &&
           copy.block.source.signature === seed.block.source.signature &&
@@ -520,25 +568,31 @@ class PageSession {
     }
     const related = this.relatedTasks(seed);
     const eligible = related.filter(
-      (task) => this.queue.has(task) && (!this.blocked || task.manual),
+      (task) =>
+        this.queue.has(task) &&
+        (!this.blocked || task.manual) &&
+        (!cacheOnly || !task.cacheChecked),
     );
     const index = eligible.indexOf(seed);
     let start = index;
     let end = index;
     let chars = seed.segment.text.length;
+    const firstScreen = this.firstProseBatch && seed.block.visible;
+    const maxSegments = firstScreen ? 2 : MAX_BATCH_SEGMENTS;
+    const maxChars = firstScreen ? 1600 : MAX_BATCH_CHARS;
     // Keep the priority seed, then include its nearest queued neighbors in document order.
     while (
       start > 0 &&
-      end - start + 1 < MAX_BATCH_SEGMENTS &&
-      chars + eligible[start - 1]!.segment.text.length <= MAX_BATCH_CHARS
+      end - start + 1 < maxSegments &&
+      chars + eligible[start - 1]!.segment.text.length <= maxChars
     ) {
       start -= 1;
       chars += eligible[start]!.segment.text.length;
     }
     while (
       end + 1 < eligible.length &&
-      end - start + 1 < MAX_BATCH_SEGMENTS &&
-      chars + eligible[end + 1]!.segment.text.length <= MAX_BATCH_CHARS
+      end - start + 1 < maxSegments &&
+      chars + eligible[end + 1]!.segment.text.length <= maxChars
     ) {
       end += 1;
       chars += eligible[end]!.segment.text.length;
@@ -601,26 +655,67 @@ class PageSession {
 
   private pump(): void {
     if (!this.active) return;
-    while (this.inflight < 2) {
+    let remaining = 16;
+    while (remaining > 0 && this.inflight < this.maxConcurrentRequests) {
       const seed = this.nextTask();
       if (!seed) break;
-      const batch = this.batch(seed);
-      const { tasks } = batch;
-      for (const task of tasks) {
-        this.queue.delete(task);
-        task.state = "pending";
-      }
-      this.inflight += 1;
-      void this.translate(batch);
+      this.dispatch(this.batch(seed), false);
+      remaining -= 1;
     }
+    // Probes are bounded separately and never admit model work on a miss.
+    while (remaining > 0 && this.cacheInflight < 2) {
+      const seed = this.nextTask(true);
+      if (!seed) break;
+      this.dispatch(this.batch(seed, true), true);
+      remaining -= 1;
+    }
+    if (remaining === 0 && this.queue.size) this.schedulePump();
     this.publish();
   }
 
-  private request(tasks: Task[]): Promise<Reply<BatchResult>> {
+  private segments(batch: TaskBatch): Segment[] {
+    return batch.shared
+      ? [batch.tasks[0]!.segment]
+      : batch.tasks.map((task) => task.segment);
+  }
+
+  private dispatch(batch: TaskBatch, cacheOnly: boolean): void {
+    const segments = this.segments(batch);
+    const key = JSON.stringify([
+      this.cacheGeneration,
+      segments.map(({ text, context }) => [text, context]),
+      (batch.shared ? [batch.tasks[0]!] : batch.tasks).map(
+        (task) => task.block.source.signature,
+      ),
+    ]);
+    for (const task of batch.tasks) {
+      this.dequeue(task);
+      task.state = "pending";
+      if (cacheOnly) task.cacheChecked = true;
+    }
+    const pending = this.pendingBatches.get(key);
+    if (pending) {
+      pending.batches.push(batch);
+      return;
+    }
+    const flight: PendingBatch = { key, segments, batches: [batch] };
+    this.pendingBatches.set(key, flight);
+    if (cacheOnly) this.cacheInflight += 1;
+    else {
+      this.inflight += 1;
+      if (!batch.shared) this.firstProseBatch = false;
+    }
+    void this.translate(flight, cacheOnly);
+  }
+
+  private request(
+    segments: Segment[],
+    cacheOnly: boolean,
+  ): Promise<Reply<BatchResult | null>> {
     // Chrome 120 predates Promise.withResolvers(); the executor keeps the declared browser floor.
     return new Promise((resolve) => {
       let settled = false;
-      const finish = (reply: Reply<BatchResult>): void => {
+      const finish = (reply: Reply<BatchResult | null>): void => {
         if (settled) return;
         settled = true;
         window.clearTimeout(timeout);
@@ -641,21 +736,46 @@ class PageSession {
         100_000,
       );
       this.waitingRequests.add(finish);
-      void sendMessage<BatchResult>({
-        type: "page:translate",
+      void sendMessage<BatchResult | null>({
+        type: cacheOnly ? "page:cached" : "page:translate",
         sessionId: this.id,
         requestId: crypto.randomUUID(),
-        segments: tasks.map((task) => task.segment),
+        segments,
       }).then(finish);
     });
   }
 
-  private async translate({ tasks, shared }: TaskBatch): Promise<void> {
-    const sharedSegment = shared ? tasks[0]!.segment : undefined;
-    const reply = await this.request(shared ? [tasks[0]!] : tasks);
-    this.inflight -= 1;
+  private async translate(flight: PendingBatch, cacheOnly: boolean): Promise<void> {
+    const reply = await this.request(flight.segments, cacheOnly);
+    this.pendingBatches.delete(flight.key);
+    if (cacheOnly) this.cacheInflight -= 1;
+    else this.inflight -= 1;
     if (!this.active) return;
-    if (!tasks.some((task) => this.current(task))) {
+    if (!flight.batches.some((batch) => batch.tasks.some((task) => this.current(task)))) {
+      this.schedulePump();
+      this.publish();
+      return;
+    }
+    if (cacheOnly && reply.ok && reply.value === null) {
+      let failed: Set<Block> | undefined;
+      for (const batch of flight.batches)
+        for (const task of batch.tasks) {
+          if (!this.current(task)) continue;
+          task.cacheChecked = true;
+          if (this.blocked && !task.manual) {
+            task.state = "failed";
+            task.error = this.blocked;
+            (failed ??= new Set()).add(task.block);
+          } else {
+            task.state = "queued";
+            this.enqueue(task);
+          }
+        }
+      const failedBlocks = failed;
+      if (failedBlocks)
+        this.preserveReadingPosition(() => {
+          for (const block of failedBlocks) this.render(block);
+        });
       this.schedulePump();
       this.publish();
       return;
@@ -667,11 +787,49 @@ class PageSession {
       this.stop("翻译会话已失效，请使用翻译快捷键重新开始。");
       return;
     }
-    this.preserveReadingPosition(() =>
-      this.applyTranslation(tasks, reply, sharedSegment),
-    );
+    this.preserveReadingPosition(() => {
+      for (const batch of flight.batches)
+        this.applyTranslation(
+          batch.tasks,
+          this.remapReply(reply, flight.segments, this.segments(batch)),
+          batch.shared ? batch.tasks[0]!.segment : undefined,
+        );
+    });
     this.schedulePump();
     this.publish();
+  }
+
+  private remapReply(
+    reply: Reply<BatchResult | null>,
+    original: Segment[],
+    target: Segment[],
+  ): Reply<BatchResult> {
+    if (!reply.ok) return reply;
+    const items = reply.value?.translations;
+    if (!Array.isArray(items) || items.length !== original.length)
+      return { ok: false, error: INVALID_RESPONSE };
+    const byId = new Map(items.map((item) => [item?.id, item]));
+    if (
+      byId.size !== original.length ||
+      target.length !== original.length ||
+      original.some((segment) => {
+        const item = byId.get(segment.id);
+        return item?.revision !== segment.revision ||
+          typeof item.text !== "string" || !item.text.trim();
+      })
+    )
+      return { ok: false, error: INVALID_RESPONSE };
+    return {
+      ok: true,
+      value: {
+        ...reply.value!,
+        translations: target.map((segment, index) => ({
+          ...byId.get(original[index]!.id)!,
+          id: segment.id,
+          revision: segment.revision,
+        })),
+      },
+    };
   }
 
   private applyTranslation(
@@ -751,7 +909,7 @@ class PageSession {
       this.blocked = reply.error;
       for (const task of this.queue) {
         if (task.manual) continue;
-        this.queue.delete(task);
+        this.dequeue(task);
         task.state = "failed";
         task.error = reply.error;
         changed.add(task.block);
@@ -821,7 +979,8 @@ class PageSession {
         task.state = "queued";
         task.error = undefined;
         task.manual = true;
-        this.queue.add(task);
+        task.cacheChecked = false;
+        this.enqueue(task);
         this.render(block);
         this.schedulePump();
         this.publish();
@@ -889,12 +1048,25 @@ function isPageMessage(value: unknown): value is PageMessage {
       (!("sessionId" in value) || typeof value.sessionId === "string") &&
       (!("reason" in value) || typeof value.reason === "string")
     );
+  if (
+    !("sessionId" in value) ||
+    typeof value.sessionId !== "string" ||
+    value.sessionId.length < 1 ||
+    value.sessionId.length > 160
+  )
+    return false;
+  if (value.type === "page:cache-cleared") return true;
+  if (
+    !("maxConcurrentRequests" in value) ||
+    typeof value.maxConcurrentRequests !== "number" ||
+    !Number.isInteger(value.maxConcurrentRequests) ||
+    value.maxConcurrentRequests < 1 ||
+    value.maxConcurrentRequests > MAX_CONCURRENT_REQUESTS
+  )
+    return false;
+  if (value.type === "page:concurrency") return true;
   return (
     value.type === "page:start" &&
-    "sessionId" in value &&
-    typeof value.sessionId === "string" &&
-    value.sessionId.length > 0 &&
-    value.sessionId.length <= 160 &&
     "targetLanguage" in value &&
     typeof value.targetLanguage === "string" &&
     LANGUAGES.some((language) => language.value === value.targetLanguage) &&
@@ -927,11 +1099,20 @@ export function installContentController(
         message.sessionId,
         message.targetLanguage,
         message.displayMode,
+        message.maxConcurrentRequests,
         (ended) => {
           if (session === ended) session = undefined;
         },
         isValid,
       );
+    } else if (
+      message.type === "page:concurrency" && message.sessionId === session?.id
+    ) {
+      session.setConcurrency(message.maxConcurrentRequests);
+    } else if (
+      message.type === "page:cache-cleared" && message.sessionId === session?.id
+    ) {
+      session.clearCacheReuse();
     } else if (
       message.type === "page:stop" &&
       (!message.sessionId || message.sessionId === session?.id)

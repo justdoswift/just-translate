@@ -1,6 +1,7 @@
 import {
   DEFAULT_SETTINGS,
   LANGUAGES,
+  MAX_CONCURRENT_REQUESTS,
   apiOriginPattern,
   normalizeBaseUrl,
   type Settings,
@@ -53,6 +54,7 @@ export function validateSettings(value: unknown): Settings {
   }
   for (const [field, maximum, integer] of [
     ["cacheDays", 365, true],
+    ["maxConcurrentRequests", MAX_CONCURRENT_REQUESTS, true],
     ["monthlyBudgetUsd", 1_000_000, false],
     ["pageTokenLimit", 100_000_000, true],
     ["inputPricePerMillion", 100_000, false],
@@ -62,7 +64,7 @@ export function validateSettings(value: unknown): Settings {
     if (
       typeof number !== "number" ||
       !Number.isFinite(number) ||
-      number < (field === "cacheDays" ? 1 : 0) ||
+      number < (field === "cacheDays" || field === "maxConcurrentRequests" ? 1 : 0) ||
       number > maximum ||
       (integer && !Number.isInteger(number))
     ) {
@@ -83,6 +85,7 @@ export function validateSettings(value: unknown): Settings {
     rememberKey: item.rememberKey as boolean,
     persistentCache: item.persistentCache as boolean,
     cacheDays: item.cacheDays as number,
+    maxConcurrentRequests: item.maxConcurrentRequests as number,
     monthlyBudgetUsd: item.monthlyBudgetUsd as number,
     pageTokenLimit: item.pageTokenLimit as number,
     inputPricePerMillion: item.inputPricePerMillion as number,

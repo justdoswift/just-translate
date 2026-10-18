@@ -11,6 +11,8 @@ export interface PreparedRequest {
 export interface ProviderResult extends TokenUsage {
   items: { id: string; translation: string }[];
 }
+export type ReleaseAttempt = () => void;
+export type AcquireAttempt = (signal: AbortSignal) => Promise<ReleaseAttempt>;
 
 function contextExcerpt(text: string, limit: number, end = false): string {
   if (text.length <= limit) return text;
@@ -269,6 +271,8 @@ export async function requestTranslation(
   request: PreparedRequest,
   signal: AbortSignal,
   beforeDispatch: () => Promise<void>,
+  onRateLimit?: (delayMs: number) => void,
+  acquireAttempt?: AcquireAttempt,
 ): Promise<ProviderResult> {
   checkAbort(signal);
   await requireApiPermission(settings);
@@ -276,6 +280,7 @@ export async function requestTranslation(
   let timedOut = false;
   let dispatched = false;
   let pendingCharge = false;
+  let releaseAttempt: ReleaseAttempt | undefined;
   const onAbort = () => controller.abort();
   signal.addEventListener("abort", onAbort, { once: true });
   if (signal.aborted) controller.abort();
@@ -285,6 +290,8 @@ export async function requestTranslation(
   }, 24_000);
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
+      checkAbort(controller.signal);
+      releaseAttempt = await acquireAttempt?.(controller.signal);
       checkAbort(controller.signal);
       await beforeDispatch();
       checkAbort(controller.signal);
@@ -321,6 +328,7 @@ export async function requestTranslation(
         } catch (error) {
           if (controller.signal.aborted) throw error;
         }
+        checkAbort(controller.signal);
         if (response.status === 401 || response.status === 403)
           throw new RequestError(
             "authentication",
@@ -342,10 +350,17 @@ export async function requestTranslation(
               ? seconds * 1000
               : Date.parse(header) - Date.now()
             : 1000;
+          // Notify for every explicit 429, including the final bounded attempt.
+          // Invalid dates use a short cooldown; long valid windows are not retried early.
+          const cooldown = Number.isFinite(delay) ? Math.max(250, delay) : 1000;
+          onRateLimit?.(Math.min(cooldown, Number.MAX_SAFE_INTEGER - Date.now()));
+          releaseAttempt?.();
+          releaseAttempt = undefined;
           if (attempt === 0 && Number.isFinite(delay) && delay <= 8000) {
             await new Promise<void>((resolve, reject) => {
               const abort = () => {
                 clearTimeout(timer);
+                controller.signal.removeEventListener("abort", abort);
                 reject(new RequestError("cancelled", "翻译已停止。"));
               };
               const timer = setTimeout(
@@ -475,6 +490,7 @@ export async function requestTranslation(
     failure.dispatched = dispatched;
     throw failure;
   } finally {
+    releaseAttempt?.();
     clearTimeout(timeout);
     signal.removeEventListener("abort", onAbort);
   }

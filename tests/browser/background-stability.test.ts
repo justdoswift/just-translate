@@ -219,3 +219,134 @@ test("a failed settings commit preserves the running page and its provider crede
     await worker.evaluate("globalThis.__justTranslateBrowserTest.restoreSend()");
   }
 });
+
+test("startup keeps endpoint and credential together across a concurrent settings commit", { timeout: 60_000 }, async (t) => {
+  const profile = await mkdtemp(path.join(tmpdir(), "just-translate-startup-"));
+  const requests: { url: string | undefined; authorization: string | undefined }[] = [];
+  const server = createServer(async (request, response) => {
+    if (request.method === "POST") {
+      let body = "";
+      for await (const chunk of request) body += chunk;
+      const input = JSON.parse(JSON.parse(body).messages.at(-1).content);
+      requests.push({ url: request.url, authorization: request.headers.authorization });
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({
+          items: input.items.map((item: { id: string; text: string }) => ({
+            id: item.id, text: `译文：${item.text}`,
+          })),
+        }) }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 100, completion_tokens: 30 },
+      }));
+      return;
+    }
+    response.setHeader("Content-Type", "text/html; charset=utf-8");
+    response.end('<!doctype html><html lang="en"><article><p>Provider credentials must stay with their original endpoint.</p></article></html>');
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const base = `http://127.0.0.1:${address.port}`;
+  let context: BrowserContext | undefined;
+  t.after(async () => {
+    await context?.close();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(profile, { recursive: true, force: true });
+  });
+  const extension = await instrumentExtension(profile);
+  context = await chromium.launchPersistentContext(profile, {
+    executablePath: chromium.executablePath(),
+    headless: true,
+    ignoreDefaultArgs: ["--disable-extensions"],
+    args: [`--disable-extensions-except=${extension}`, `--load-extension=${extension}`],
+  });
+  const worker = context.serviceWorkers()[0] ?? await context.waitForEvent("serviceworker");
+  const id = new URL(worker.url()).host;
+  const manager = await context.newPage();
+  await manager.goto("chrome://extensions");
+  await manager.evaluate(`chrome.developerPrivate.addHostPermission(${JSON.stringify(id)}, "http://127.0.0.1/*")`);
+  const options = await context.newPage();
+  await options.goto(`chrome-extension://${id}/options.html`);
+  await options.locator("#settings-fields:enabled").waitFor();
+  await options.locator('input[value="custom"]').check();
+  await options.locator("#base-url").fill(`${base}/previous`);
+  await options.locator("#model").fill("test-model");
+  await options.locator("#api-key").fill("previous-test-key");
+  await options.locator("#save-settings").click();
+  await options.locator("#save-settings:enabled").waitFor();
+  const saved: Reply<SettingsView> = await options.evaluate(() =>
+    chrome.runtime.sendMessage({ type: "settings:get" }));
+  assert.ok(saved.ok && saved.value.configured);
+  const page = await context.newPage();
+  await page.goto(`${base}/article`);
+  await page.bringToFront();
+  await worker.evaluate(`(() => {
+    const harness = globalThis.__justTranslateBrowserTest;
+    const execute = chrome.scripting.executeScript.bind(chrome.scripting);
+    const set = chrome.storage.session.set.bind(chrome.storage.session);
+    let injected, committed, releaseInjection, releaseCleanup;
+    harness.injected = new Promise(resolve => injected = resolve);
+    harness.committed = new Promise(resolve => committed = resolve);
+    const injectionGate = new Promise(resolve => releaseInjection = resolve);
+    const cleanupGate = new Promise(resolve => releaseCleanup = resolve);
+    chrome.scripting.executeScript = async (...args) => {
+      const result = await execute(...args);
+      injected();
+      await injectionGate;
+      return result;
+    };
+    chrome.storage.session.set = async items => {
+      const keys = items["justTranslate.apiKey"];
+      if (keys && Object.keys(keys).length === 1 &&
+          Object.values(keys)[0] === "replacement-test-key") {
+        committed();
+        await cleanupGate;
+      }
+      return set(items);
+    };
+    harness.releaseInjection = releaseInjection;
+    harness.releaseCleanup = releaseCleanup;
+    harness.restoreStartupRace = () => {
+      releaseInjection();
+      releaseCleanup();
+      chrome.scripting.executeScript = execute;
+      chrome.storage.session.set = set;
+    };
+  })()`);
+  let save: Promise<Reply<SettingsSaveResult>> | undefined;
+  try {
+    await worker.evaluate(`(async () => {
+      const harness = globalThis.__justTranslateBrowserTest;
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      harness.startup = harness.commandListeners[0]("toggle-translation", tab);
+      await harness.injected;
+    })()`);
+    save = options.evaluate((configuration) =>
+      chrome.runtime.sendMessage({
+        type: "settings:save", settings: configuration, apiKey: "replacement-test-key",
+      }), { ...saved.value.settings, baseUrl: `${base}/replacement` });
+    await worker.evaluate("globalThis.__justTranslateBrowserTest.committed");
+    await worker.evaluate(`(async () => {
+      const harness = globalThis.__justTranslateBrowserTest;
+      harness.releaseInjection();
+      await harness.startup;
+    })()`);
+    await page.locator('[aria-label="Just Translate 译文"][aria-busy="false"]').waitFor();
+    assert.deepEqual(requests, [{
+      url: "/previous/chat/completions", authorization: "Bearer previous-test-key",
+    }], "a startup snapshot must never pair the replacement endpoint with the previous credential");
+    await worker.evaluate("globalThis.__justTranslateBrowserTest.releaseCleanup()");
+    assert.ok((await save).ok);
+    await page.waitForFunction(() => !document.querySelector('[aria-label="Just Translate 译文"]'));
+    await dispatchTranslationCommand(worker, page);
+    await page.locator('[aria-label="Just Translate 译文"][aria-busy="false"]').waitFor();
+    assert.deepEqual(requests[1], {
+      url: "/replacement/chat/completions", authorization: "Bearer replacement-test-key",
+    });
+  } finally {
+    await worker.evaluate("globalThis.__justTranslateBrowserTest.restoreStartupRace()");
+    await save;
+  }
+});

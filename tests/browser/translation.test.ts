@@ -490,7 +490,7 @@ for (const displayMode of ["bilingual", "translation"] as const) {
           ["A reader comments about cycling."],
           ["Another reader comments about music."],
         ] as const;
-        const groupOf = new Map(
+        const groupOf = new Map<string, number>(
           groups.flatMap((texts, group) =>
             texts.map((text) => [text, group] as const),
           ),
@@ -511,12 +511,30 @@ for (const displayMode of ["bilingual", "translation"] as const) {
           [...groupOf].map(([text]) => translations.get(text)!),
         );
         const groupedRequests = pageRequests.slice(requestStart);
+        for (const request of groupedRequests) {
+          const texts = request.items.map((item) => item.text);
+          assert.ok(texts.length > 0, "translation requests must contain source text");
+          const group = groupOf.get(texts[0]!);
+          assert.notEqual(group, undefined, "requests must contain known source paragraphs");
+          assert.ok(
+            texts.every((text) => groupOf.get(text) === group),
+            "headings, cards and comments must not share a translation request",
+          );
+          const groupTexts = groups[group!];
+          assert.ok(groupTexts);
+          const ordered = groupTexts.filter((text) => texts.includes(text));
+          assert.deepEqual(texts, ordered, "source paragraphs must retain document order within each request");
+          assert.ok(
+            [...groupOf].every(([text, candidateGroup]) =>
+              candidateGroup === group || !request.context.join("").includes(text),
+            ),
+            "request context must not cross heading, card or comment boundaries",
+          );
+        }
         assert.deepEqual(
-          groupedRequests
-            .map((request) => request.items.map((item) => item.text))
-            .sort(),
-          [...groups].sort(),
-          "related prose stays ordered; headings, cards and comments are separate requests",
+          groupedRequests.flatMap((request) => request.items.map((item) => item.text)).sort(),
+          [...groupOf.keys()].sort(),
+          "every source paragraph must be translated without omissions or duplicates",
         );
         const added = "He baked it in the oven.";
         translations.set(added, "他把面团放进烤箱烘烤。");
