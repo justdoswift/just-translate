@@ -21,7 +21,7 @@ import {
   splitSource,
   type ExtractedSource,
 } from "./extraction";
-import { contextExcerpt, relatedElements } from "./context";
+import { contextExcerpt, isIsolatedElement, relatedElements } from "./context";
 import { observeNavigation, type NavigationWatch } from "./navigation";
 import { createTranslationView, type TranslationView } from "./renderer";
 import { preserveReadingPosition } from "./reading-position";
@@ -34,6 +34,10 @@ interface Task {
   text?: string;
   error?: AppError;
   manual: boolean;
+}
+interface TaskBatch {
+  tasks: Task[];
+  shared: boolean;
 }
 interface Block {
   id: string;
@@ -84,6 +88,7 @@ class PageSession {
   private running = true;
   private readonly blocks = new Map<Element, Block>();
   private readonly queue = new Set<Task>();
+  private readonly tasksByText = new Map<string, Set<Task>>();
   private readonly owned = new WeakSet<Node>();
   private readonly viewOwners = new WeakMap<Node, Block>();
   private readonly dirty = new Map<
@@ -172,6 +177,7 @@ class PageSession {
     });
     this.blocks.clear();
     this.queue.clear();
+    this.tasksByText.clear();
     this.dirty.clear();
     if (notify && this.isContextValid()) {
       void sendMessage<void>({
@@ -397,17 +403,32 @@ class PageSession {
         manual: false,
       };
     });
-    for (const task of oldTasks)
+    for (const task of oldTasks) {
+      this.unindex(task);
       if (!block.tasks.includes(task)) this.queue.delete(task);
+    }
     this.blocks.set(element, block);
     if (!previous) this.intersection.observe(element);
-    for (const task of block.tasks)
+    for (const task of block.tasks) {
+      let copies = this.tasksByText.get(task.segment.text);
+      if (!copies) this.tasksByText.set(task.segment.text, (copies = new Set()));
+      copies.add(task);
       if (task.state === "queued") this.queue.add(task);
+    }
     this.render(block);
   }
 
+  private unindex(task: Task): void {
+    const copies = this.tasksByText.get(task.segment.text);
+    copies?.delete(task);
+    if (copies?.size === 0) this.tasksByText.delete(task.segment.text);
+  }
+
   private release(block: Block): void {
-    for (const task of block.tasks) this.queue.delete(task);
+    for (const task of block.tasks) {
+      this.queue.delete(task);
+      this.unindex(task);
+    }
     block.view?.remove();
     block.view = undefined;
     this.intersection.unobserve(block.element);
@@ -475,7 +496,28 @@ class PageSession {
       .flatMap((element) => this.blocks.get(element)?.tasks ?? []);
   }
 
-  private batch(seed: Task): Task[] {
+  private batch(seed: Task): TaskBatch {
+    const isolated = (task: Task): boolean =>
+      task.block.tasks.length === 1 &&
+      isIsolatedElement(task.block.element, this.isOwned);
+    if (isolated(seed)) {
+      // Identical independent labels share one wire item, not a manufactured context.
+      const tasks = [seed];
+      for (const copy of this.tasksByText.get(seed.segment.text) ?? []) {
+        if (
+          copy !== seed &&
+          this.queue.has(copy) &&
+          this.current(copy) &&
+          !copy.block.dirty &&
+          (!this.blocked || copy.manual) &&
+          copy.block.source.signature === seed.block.source.signature &&
+          isolated(copy)
+        )
+          tasks.push(copy);
+      }
+      for (const task of tasks) task.segment = { ...task.segment, context: "" };
+      return { tasks, shared: true };
+    }
     const related = this.relatedTasks(seed);
     const eligible = related.filter(
       (task) => this.queue.has(task) && (!this.blocked || task.manual),
@@ -510,7 +552,17 @@ class PageSession {
     for (const [itemIndex, task] of tasks.entries()) {
       const offset = related.indexOf(task);
       for (const direction of [-1, 1]) {
-        const neighbor = related[offset + direction];
+        let neighborIndex = offset + direction;
+        let neighbor = related[neighborIndex];
+        // Repeated wording is not context; retain the nearest distinct passage in this group.
+        while (
+          neighbor &&
+          !selected.has(neighbor) &&
+          sources.has(neighbor.segment.text)
+        ) {
+          neighborIndex += direction;
+          neighbor = related[neighborIndex];
+        }
         if (
           !neighbor ||
           selected.has(neighbor) ||
@@ -544,7 +596,7 @@ class PageSession {
     });
     const context = hints.length ? JSON.stringify(hints) : "";
     for (const task of tasks) task.segment = { ...task.segment, context };
-    return tasks;
+    return { tasks, shared: false };
   }
 
   private pump(): void {
@@ -552,13 +604,14 @@ class PageSession {
     while (this.inflight < 2) {
       const seed = this.nextTask();
       if (!seed) break;
-      const tasks = this.batch(seed);
+      const batch = this.batch(seed);
+      const { tasks } = batch;
       for (const task of tasks) {
         this.queue.delete(task);
         task.state = "pending";
       }
       this.inflight += 1;
-      void this.translate(tasks);
+      void this.translate(batch);
     }
     this.publish();
   }
@@ -597,8 +650,9 @@ class PageSession {
     });
   }
 
-  private async translate(tasks: Task[]): Promise<void> {
-    const reply = await this.request(tasks);
+  private async translate({ tasks, shared }: TaskBatch): Promise<void> {
+    const sharedSegment = shared ? tasks[0]!.segment : undefined;
+    const reply = await this.request(shared ? [tasks[0]!] : tasks);
     this.inflight -= 1;
     if (!this.active) return;
     if (!tasks.some((task) => this.current(task))) {
@@ -613,12 +667,18 @@ class PageSession {
       this.stop("翻译会话已失效，请使用翻译快捷键重新开始。");
       return;
     }
-    this.preserveReadingPosition(() => this.applyTranslation(tasks, reply));
+    this.preserveReadingPosition(() =>
+      this.applyTranslation(tasks, reply, sharedSegment),
+    );
     this.schedulePump();
     this.publish();
   }
 
-  private applyTranslation(tasks: Task[], reply: Reply<BatchResult>): void {
+  private applyTranslation(
+    tasks: Task[],
+    reply: Reply<BatchResult>,
+    sharedSegment?: Segment,
+  ): void {
     const translations = new Map<string, Translation>();
     let invalid = false;
     if (reply.ok) {
@@ -639,6 +699,18 @@ class PageSession {
           }
           translations.set(item.id, item);
         }
+    }
+    if (reply.ok && !invalid && sharedSegment) {
+      const result = translations.get(sharedSegment.id);
+      if (translations.size !== 1 || result?.revision !== sharedSegment.revision)
+        invalid = true;
+      else
+        for (const task of tasks)
+          translations.set(task.segment.id, {
+            ...result,
+            id: task.segment.id,
+            revision: task.segment.revision,
+          });
     }
     const changed = new Set<Block>();
     const checkedSources = new Map<Block, string | undefined>();

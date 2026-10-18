@@ -81,6 +81,7 @@ export class TranslationEngine {
   private running = 0;
   private queued = 0;
   private activeSegments = new Map<string, Set<string>>();
+  private pendingBatches = new Map<string, Promise<BatchResult>>();
   private tests = new Set<AbortController>();
 
   constructor(readonly state: TranslationState) {}
@@ -118,24 +119,108 @@ export class TranslationEngine {
     for (const identity of identities) active.add(identity);
     this.activeSegments.set(session.id, active);
     session.requests.add(requestId);
+    return this.translateBatch(session, requestId, segments).finally(() => {
+      for (const identity of identities) active.delete(identity);
+      if (!active.size) this.activeSegments.delete(session.id);
+    });
+  }
+
+  private async translateBatch(
+    session: TranslationSession,
+    requestId: string,
+    segments: Segment[],
+  ): Promise<BatchResult> {
+    await requireApiPermission(session.settings);
+    await session.persist?.();
+    checkAbort(session.controller.signal);
+    // Ordered companion sources affect meaning; ephemeral DOM IDs do not.
+    const contextIdentity = JSON.stringify([
+      segments.map((segment) => segment.text),
+      [...new Set(segments.map((segment) => segment.context))],
+    ]);
+    const keys = await Promise.all(
+      segments.map((segment) =>
+        translationCacheKey(session.settings, session.fingerprint, {
+          ...segment,
+          context: contextIdentity,
+        }),
+      ),
+    );
+    const cached = await this.state.lookup(keys);
+    checkAbort(session.controller.signal);
+    if (cached.values.every((text) => text !== undefined))
+      return this.completeReuse(
+        session, requestId, segments, cached.values, cached.generation,
+      );
+
+    // A flight belongs to one cancellation owner and one cache generation.
+    const flightKey = JSON.stringify([session.id, cached.generation, keys]);
+    const pending = this.pendingBatches.get(flightKey);
+    if (pending) {
+      const result = await pending;
+      return this.completeReuse(
+        session,
+        requestId,
+        segments,
+        result.translations.map((translation) => translation.text),
+      );
+    }
+    const operation = this.runBatch(session, requestId, segments, keys).finally(
+      () => this.pendingBatches.delete(flightKey),
+    );
+    this.pendingBatches.set(flightKey, operation);
+    return operation;
+  }
+
+  private async completeReuse(
+    session: TranslationSession,
+    requestId: string,
+    segments: Segment[],
+    texts: string[],
+    cacheGeneration?: number,
+  ): Promise<BatchResult> {
+    checkAbort(session.controller.signal);
+    const journalId = `${session.id}:${requestId}`;
+    await this.state.reserve(journalId, session.id, session.settings, 0, 0);
+    try {
+      checkAbort(session.controller.signal);
+      const result: BatchResult = {
+        translations: segments.map((segment, index) => ({
+          id: segment.id,
+          revision: segment.revision,
+          text: texts[index]!,
+          cached: true,
+        })),
+        inputTokens: 0,
+        outputTokens: 0,
+        estimated: false,
+      };
+      await this.state.complete(journalId, result);
+      checkAbort(session.controller.signal);
+      if (cacheGeneration !== undefined) {
+        await this.state.insert([], cacheGeneration);
+        checkAbort(session.controller.signal);
+      }
+      return result;
+    } catch (error) {
+      const failure =
+        error instanceof RequestError
+          ? error
+          : new RequestError("internal", "无法持久保存复用结果，请检查扩展存储。", true);
+      await this.state.fail(journalId, failure);
+      throw failure;
+    }
+  }
+
+  private runBatch(
+    session: TranslationSession,
+    requestId: string,
+    segments: Segment[],
+    keys: string[],
+  ): Promise<BatchResult> {
     return this.enqueue(session.id, session.controller.signal, async () => {
       checkAbort(session.controller.signal);
-      await requireApiPermission(session.settings);
-      await session.persist?.();
-      // Ordered companion sources affect meaning even when no explicit hint is needed.
-      // Exclude ephemeral DOM IDs, but invalidate cache entries when any source changes.
-      const contextIdentity = JSON.stringify([
-        segments.map((segment) => segment.text),
-        [...new Set(segments.map((segment) => segment.context))],
-      ]);
-      const keys = await Promise.all(
-        segments.map((segment) =>
-          translationCacheKey(session.settings, session.fingerprint, {
-            ...segment,
-            context: contextIdentity,
-          }),
-        ),
-      );
+      // A preceding queued request may have populated the cache in the meantime.
       const cached = await this.state.lookup(keys);
       const missing = segments.filter(
         (_segment, index) => cached.values[index] === undefined,
@@ -217,9 +302,6 @@ export class TranslationEngine {
         await this.state.fail(journalId, failure);
         throw failure;
       }
-    }).finally(() => {
-      for (const identity of identities) active.delete(identity);
-      if (!active.size) this.activeSegments.delete(session.id);
     });
   }
 

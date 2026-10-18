@@ -46,6 +46,18 @@ function sibling(
   return undefined;
 }
 
+/** Stop at the first companion instead of collecting the entire prose group. */
+export function isIsolatedElement(
+  element: Element,
+  owned: (node: Node) => boolean,
+): boolean {
+  if (!isProse(element, owned)) return true;
+  if (!element.matches(HEADING) && sibling(element, "previousSibling", owned))
+    return false;
+  const next = sibling(element, "nextSibling", owned);
+  return !next || next.matches(HEADING);
+}
+
 /** Direct prose siblings only: wrappers, independent units and headings are hard boundaries. */
 export function relatedElements(
   element: Element,
