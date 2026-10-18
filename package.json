@@ -1,6 +1,6 @@
 {
   "name": "just-translate",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "private": true,
   "description": "使用自己的 DeepSeek 或 OpenAI 兼容 API，以双语或只显示译文的方式翻译网页并自动补译动态内容。",
   "license": "MIT",
